@@ -41,7 +41,7 @@ let pendingUpdates = 0;
 const KV_SAVE_INTERVAL = 180000; // 每3分钟保存一次
 const MAX_PENDING_UPDATES = 20; // 积累20次更新后强制保存
 
-// ==================== 日志类 ====================
+// ==================== 日志类 ===================
 class Logger {
   static debug(message, ...args) {
     if (logLevel === "debug") {
