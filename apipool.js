@@ -6,7 +6,9 @@ const API_ENDPOINTS = {
   embeddings: "/v1/embeddings",
   images: "/v1/images/generations",
   models: "/v1/models",
+  audio: "/v1/audio/transcriptions",
   userInfo: "/v1/user/info",
+  rerank: "/v1/rerank", 
 };
 
 const KV_KEYS = {
@@ -41,7 +43,7 @@ let logLevel = "debug"; // debug, info, warn, error
 // 全局统计变量
 let lastKVSaveTime = Date.now();
 let pendingUpdates = 0;
-const KV_SAVE_INTERVAL = 180000; // 每3分钟保存一次
+const KV_SAVE_INTERVAL = 300000; // 每5分钟保存一次
 const MAX_PENDING_UPDATES = 20; // 积累20次更新后强制保存
 
 // ==================== 日志类 ===================
@@ -124,6 +126,43 @@ function getBJTimeString() {
   const date = new Date();
   const bjTime = new Date(date.getTime() + 8 * 60 * 60 * 1000);
   return bjTime.toISOString().replace("T", " ").substring(0, 19);
+}
+
+/**
+ * 估算文本内容的token数量
+ * @param {string} text 要估算的文本
+ * @param {boolean} isChatMessage 是否为聊天消息（需要额外计算消息格式开销）
+ * @param {string} textType 文本类型，可选值：'normal'(默认), 'image_prompt'
+ * @returns {number} 估算的token数量
+ */
+function estimateTokenCount(text, isChatMessage = false, textType = "normal") {
+  if (!text) return 0;
+
+  // 计算中文字符数和总字符数
+  const chineseChars = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+  const totalChars = text.length;
+  const nonChineseChars = totalChars - chineseChars;
+
+  let estimatedTokens = 0;
+
+  // 根据文本类型使用不同的估算逻辑
+  switch (textType) {
+    case "image_prompt":
+      // 图片提示词通常需要更详细的描述，token使用效率更高
+      // 中文字符约0.6个token/字，非中文字符约0.2个token/字（5字/token）
+      estimatedTokens = Math.ceil(chineseChars * 0.6) + Math.ceil(nonChineseChars / 5);
+      break;
+
+    case "normal":
+    default:
+      // 普通文本
+      // 中文字符约0.7个token/字，非中文字符约0.25个token/字（4字/token）
+      estimatedTokens = Math.ceil(chineseChars * 0.7) + Math.ceil(nonChineseChars / 4);
+      break;
+  }
+
+  // 如果是聊天消息，添加消息格式开销（约4个token）
+  return isChatMessage ? estimatedTokens + 4 : estimatedTokens;
 }
 
 // 添加令牌到KV
@@ -901,22 +940,33 @@ async function handleApiRequest(req, path, headers, env) {
   // 记录开始时间
   const startTime = Date.now();
 
-  // 获取请求体
+  // 获取请求数据
   let requestBody;
-  try {
-    requestBody = await req.text();
-  } catch (error) {
-    Logger.error("无法读取请求体:", error);
-    return jsonResponse(
-      {
-        error: {
-          message: "无法处理请求数据",
-          type: "api_error",
-          code: "invalid_request",
+  let isMultipart = false;
+  const contentType = req.headers.get("Content-Type") || "";
+
+  // 检查是否为多部分表单数据请求（适用于音频转录API）
+  if (contentType.includes("multipart/form-data")) {
+    isMultipart = true;
+    // 对于multipart/form-data请求，我们直接使用原始请求体
+    requestBody = req.body;
+  } else {
+    // 对于其他请求，按原来方式处理
+    try {
+      requestBody = await req.text();
+    } catch (error) {
+      Logger.error("无法读取请求体:", error);
+      return jsonResponse(
+        {
+          error: {
+            message: "无法处理请求数据",
+            type: "api_error",
+            code: "invalid_request",
+          },
         },
-      },
-      400
-    );
+        400
+      );
+    }
   }
 
   // 重试逻辑
@@ -934,13 +984,26 @@ async function handleApiRequest(req, path, headers, env) {
       const requestHeaders = new Headers(headers);
       requestHeaders.set("Authorization", `Bearer ${token.key}`);
 
-      // 发送请求
-      const response = await fetch(url, {
+      // 准备请求选项
+      const requestOptions = {
         method: req.method,
         headers: requestHeaders,
-        body: req.method !== "GET" ? requestBody : undefined,
         redirect: "follow",
-      });
+      };
+
+      // 根据请求类型添加请求体
+      if (req.method !== "GET") {
+        if (isMultipart) {
+          // 对于multipart/form-data，直接传递原始请求体
+          requestOptions.body = requestBody;
+        } else {
+          // 对于其他请求类型，使用文本请求体
+          requestOptions.body = requestBody;
+        }
+      }
+
+      // 发送请求
+      const response = await fetch(url, requestOptions);
 
       // 读取响应数据
       const responseText = await response.text();
@@ -967,14 +1030,145 @@ async function handleApiRequest(req, path, headers, env) {
             Logger.debug(`请求使用了${tokenUsage}个prompt token`);
           }
         } else if (path.includes(API_ENDPOINTS.images)) {
-          // 图像生成请求的token估算 - 根据DALL-E 3的估算值
-          tokenUsage = 4500;
-          Logger.debug(`图像生成请求，估算使用了${tokenUsage}个token`);
+          // 图像生成请求的token估算 - 根据请求参数动态计算
+          try {
+            const requestJson = JSON.parse(requestBody);
+
+            // 基础token消耗
+            let baseTokens = 1000;
+
+            // 根据提示词长度添加token
+            if (requestJson.prompt) {
+              baseTokens += estimateTokenCount(requestJson.prompt, false, "image_prompt");
+            }
+
+            // 根据图片数量调整
+            const n = requestJson.n || 1;
+
+            // 根据尺寸调整
+            let sizeMultiplier = 1.0;
+            if (requestJson.size) {
+              // 常见尺寸的倍数
+              const sizeMappings = {
+                "256x256": 0.6,
+                "512x512": 1.0,
+                "1024x1024": 2.0,
+                "1792x1024": 2.5,
+                "1024x1792": 2.5,
+              };
+              sizeMultiplier = sizeMappings[requestJson.size] || 1.0;
+            }
+
+            // 根据质量调整
+            let qualityMultiplier = 1.0;
+            if (requestJson.quality === "hd") {
+              qualityMultiplier = 1.5;
+            }
+
+            // 计算最终的token使用量
+            tokenUsage = Math.round(baseTokens * n * sizeMultiplier * qualityMultiplier);
+
+            Logger.debug(`图像生成请求，动态估算使用了${tokenUsage}个token（图片数量：${n}，尺寸倍数：${sizeMultiplier}，质量倍数：${qualityMultiplier}）`);
+          } catch (e) {
+            // 如果解析失败，回退到默认值
+            tokenUsage = 4500;
+            Logger.debug(`图像生成请求，无法解析参数，使用默认估算${tokenUsage}个token`);
+          }
+        } else if (path.includes(API_ENDPOINTS.audio)) {
+          // 音频转录请求的token估算 - 基于实际响应内容
+          if (responseData && responseData.text) {
+            // 使用转录文本长度计算token数
+            const transcriptionText = responseData.text;
+            // 使用辅助函数估算token
+            const estimatedTokens = estimateTokenCount(transcriptionText);
+
+            // 加上基础处理开销
+            tokenUsage = Math.max(500, estimatedTokens + 500);
+            Logger.debug(`音频转录请求，基于转录内容估算使用了${tokenUsage}个token（文本长度：${transcriptionText.length}）`);
+          } else {
+            // 无法获取转录文本时，使用一个较为保守的估算
+            tokenUsage = 1500;
+            Logger.debug(`音频转录请求，无法获取转录文本，使用保守估算${tokenUsage}个token`);
+          }
+        } else if (path.includes(API_ENDPOINTS.rerank)) {
+          // 重排序请求的token估算
+          try {
+            const requestJson = JSON.parse(requestBody);
+            let totalTokens = 0;
+
+            // 计算查询的token
+            if (requestJson.query) {
+              const queryTokens = estimateTokenCount(requestJson.query);
+              totalTokens += queryTokens;
+              Logger.debug(`重排序查询token：${queryTokens}`);
+            }
+
+            // 计算文档的token
+            if (requestJson.documents && Array.isArray(requestJson.documents)) {
+              let docsTokens = 0;
+              requestJson.documents.forEach((doc) => {
+                docsTokens += estimateTokenCount(String(doc));
+              });
+              totalTokens += docsTokens;
+              Logger.debug(`重排序文档token：${docsTokens}（文档数量：${requestJson.documents.length}）`);
+            }
+
+            // 加上基础处理开销
+            tokenUsage = Math.max(100, totalTokens);
+            Logger.debug(`重排序请求估算token：${tokenUsage}`);
+          } catch (e) {
+            // 解析失败时的默认估算
+            tokenUsage = 500;
+            Logger.debug(`重排序请求解析失败，使用默认估算${tokenUsage}个token`);
+          }
         } else {
-          // 其他请求的默认token估算
-          const requestBodyLength = requestBody ? requestBody.length : 0;
-          // 粗略估算：每3个字符约为1个token
-          tokenUsage = Math.max(10, Math.ceil(requestBodyLength / 3));
+          // 优化的通用token估算方法
+          try {
+            // 尝试解析请求体为JSON
+            let requestJson;
+            try {
+              requestJson = JSON.parse(requestBody);
+            } catch (e) {
+              // 非JSON请求体，使用字符长度估算
+              const requestBodyLength = requestBody ? requestBody.length : 0;
+              tokenUsage = Math.max(10, Math.ceil(requestBodyLength / 3));
+              Logger.debug(`请求使用了非JSON格式，基于长度估算token：${tokenUsage}`);
+              throw new Error("Not JSON"); // 跳到catch块
+            }
+
+            // 处理不同类型的JSON请求
+            if (requestJson.messages && Array.isArray(requestJson.messages)) {
+              // 聊天请求的估算
+              tokenUsage = 0;
+
+              // 计算所有消息的token
+              requestJson.messages.forEach((msg) => {
+                if (msg.content) {
+                  tokenUsage += estimateTokenCount(String(msg.content), true);
+                }
+              });
+
+              Logger.debug(`聊天请求估算token：${tokenUsage}`);
+            } else if (requestJson.input || requestJson.prompt) {
+              // 处理单一输入请求（如completions或embeddings）
+              const input = String(requestJson.input || requestJson.prompt || "");
+              tokenUsage = estimateTokenCount(input);
+              Logger.debug(`单一输入请求估算token：${tokenUsage}（总字符：${input.length}）`);
+            } else {
+              // 其他JSON请求
+              const jsonLength = JSON.stringify(requestJson).length;
+              tokenUsage = Math.max(10, Math.ceil(jsonLength / 4));
+              Logger.debug(`其他JSON请求估算token：${tokenUsage}（JSON长度：${jsonLength}）`);
+            }
+          } catch (e) {
+            // 如果上面的处理出错，回退到简单估算
+            if (e.message !== "Not JSON") {
+              Logger.warn(`Token估算出错: ${e.message}，使用简单估算`);
+              const requestBodyLength = requestBody ? requestBody.length : 0;
+              tokenUsage = Math.max(10, Math.ceil(requestBodyLength / 3));
+            }
+          }
+
           Logger.debug(`无法从响应中获取token使用量，估算使用了${tokenUsage}个token`);
         }
 
@@ -1898,6 +2092,38 @@ const dashboardHtml = `
         max-width: 80px;
       }
     }
+    
+    /* GitHub图标样式 */
+    .navbar-text .bi-github {
+      font-size: 1.2rem;
+      opacity: 0.7;
+      transition: all 0.3s ease;
+      color: rgba(255, 255, 255, 0.8);
+    }
+    
+    .navbar-text:hover .bi-github {
+      opacity: 1;
+      transform: rotate(360deg) scale(1.15);
+      color: white;
+    }
+    
+    .navbar-text {
+      text-decoration: none;
+      transition: all 0.3s ease;
+      margin-left: 8px !important;
+      border-radius: 50%;
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+    }
+    
+    .navbar-text:hover {
+      color: white !important;
+      background-color: rgba(255, 255, 255, 0.1);
+    }
   </style>
 </head>
 <body>
@@ -1906,11 +2132,19 @@ const dashboardHtml = `
       <a class="navbar-brand" href="/dashboard">
         <i class="bi bi-speedometer2 me-2"></i>API管理系统
       </a>
+      <a href="https://github.com/ling-drag0n/api-pool" target="_blank" class="navbar-text text-white-50 ms-2 d-none d-md-flex align-items-center" title="在GitHub上查看项目">
+        <i class="bi bi-github"></i>
+      </a>
       <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
         <span class="navbar-toggler-icon"></span>
       </button>
       <div class="collapse navbar-collapse" id="navbarNav">
         <ul class="navbar-nav ms-auto">
+          <li class="nav-item d-md-none">
+            <a class="nav-link text-white" href="https://github.com/ling-drag0n/api-pool" target="_blank">
+              <i class="bi bi-github me-1"></i>GitHub
+            </a>
+          </li>
           <li class="nav-item">
             <a class="nav-link text-white" href="#" id="logoutBtn">
               <i class="bi bi-box-arrow-right me-1"></i>退出登录
