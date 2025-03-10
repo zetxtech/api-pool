@@ -16,6 +16,9 @@ const KV_KEYS = {
   SESSION_SECRET: "session_secret",
 };
 
+// API鉴权密钥 - 自定义修改为您的密钥，用于验证API请求
+const API_KEY = "sk-yourCustomApiKey123456789";
+
 // 默认管理员密码 - 自定义修改为更安全的密码
 const DEFAULT_ADMIN_PASSWORD = "xxx";
 
@@ -849,6 +852,36 @@ async function checkTokenBalance(token, forceRefresh = false) {
 // ==================== API请求处理 ====================
 // 处理API请求
 async function handleApiRequest(req, path, headers, env) {
+  // 验证API密钥
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return jsonResponse(
+      {
+        error: {
+          message: "缺少有效的API密钥",
+          type: "authentication_error",
+          code: "invalid_api_key",
+        },
+      },
+      401
+    );
+  }
+
+  const providedApiKey = authHeader.substring(7).trim();
+  if (providedApiKey !== API_KEY) {
+    Logger.warn(`无效的API密钥尝试: ${obfuscateKey(providedApiKey)}`);
+    return jsonResponse(
+      {
+        error: {
+          message: "无效的API密钥",
+          type: "authentication_error",
+          code: "invalid_api_key",
+        },
+      },
+      401
+    );
+  }
+
   // 选择合适的令牌
   const token = selectTokenForRequest(path);
 
