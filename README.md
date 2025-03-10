@@ -48,10 +48,15 @@ API 池管理系统是一个专为管理 OpenAI 格式 API 密钥设计的应用
 
 ### 方式一：
 
+#### 手动：
 1. 创建 Cloudflare 账号（如果没有）
 2. 复制apipool.js 到worker中粘贴
 3. 创建 KV 命名空间 ：API_TOKENS
 4. worker绑定KV即可
+
+#### 自动：
+
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ling-drag0n/api-pool)
 
 ### 方式二：通过 Wrangler CLI 部署
 
