@@ -1,6 +1,6 @@
 // ctrl+f 搜索 自定义 ，修改你需要自定义的配置
 // ==================== 常量定义 ====================
-const API_BASE_URL = "https://api.siliconflow.cn"; // 自定义修改为您的API地址 openai格式
+const API_BASE_URL = "https://api.siliconflow.cn"; // 可自定义修改为您的API地址 openai格式
 const API_ENDPOINTS = {
   chat: "/v1/chat/completions",
   embeddings: "/v1/embeddings",
@@ -383,7 +383,7 @@ function cleanupOldRequestData() {
       Logger.debug(`清理了${minuteCleanupCount}条分钟级统计数据`);
     }
 
-    // 清理天级数据，参考Python的实现
+    // 清理天级数据
     let dayCleanupCount = 0;
 
     // 确保数组长度一致
