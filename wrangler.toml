@@ -1,0 +1,13 @@
+# 项目名称和兼容性设置
+name = "api-pool-system"
+main = "apipool.js"
+compatibility_date = "2024-01-01"
+
+# Workers 运行时设置
+workers_dev = true  
+
+# KV 命名空间绑定
+[[kv_namespaces]]
+binding = "API_TOKENS"  
+id = "xxxxx"           # 替换为你的 KV 命名空间 ID
+
