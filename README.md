@@ -46,58 +46,64 @@ API 池管理系统是一个专为管理 OpenAI 格式 API 密钥设计的应用
 
 ## 部署教程
 
-### 方式一：
+### 方式一：手动部署
 
-1. 登录 Cloudflare 账号，如果没有请先[注册](https://dash.cloudflare.com/sign-up)
-2. 复制apipool.js 到 worker中粘贴
+1. 创建 Cloudflare 账号（如果没有）
+2. 复制 apipool.js 到 worker 中粘贴
 3. 创建 KV 命名空间 ：API_TOKENS
-4. worker绑定KV即可
+4. worker 绑定 KV 即可
 
 ### 方式二：通过 Wrangler CLI 部署
 
 1. 安装 Wrangler CLI
+
 ```bash
 npm install -g wrangler
 ```
 
 2. 登录到你的 Cloudflare 账号
+
 ```bash
 wrangler login
 ```
 
 3. 创建项目目录并初始化文件
+
 ```bash
 mkdir api-pool-system
 cd api-pool-system
 ```
 
 4. 创建必要的文件：
+
    - `apipool.js`：复制主程序代码
    - `wrangler.toml`：创建配置文件
 
 5. 创建 KV 命名空间并获取 ID
+
 ```bash
 wrangler kv:namespace create "API_TOKENS"
 ```
 
 6. 更新 `wrangler.toml` 文件，填入 KV 命名空间 ID：
+
 ```toml
 name = "api-pool-system"
 main = "apipool.js"
 compatibility_date = "2024-01-01"
 
-workers_dev = true  
+workers_dev = true
 
 [[kv_namespaces]]
-binding = "API_TOKENS"  
+binding = "API_TOKENS"
 id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"   # 替换为上面命令输出的 id
 ```
 
 7. 部署到 Cloudflare Workers
+
 ```bash
 wrangler deploy
 ```
-
 
 部署成功后，您将获得一个`*.workers.dev`的 URL，例如`https://api-pool-system.username.workers.dev`。
 注意修改以下内容：
@@ -112,6 +118,7 @@ wrangler deploy
    ```javascript
    const DEFAULT_ADMIN_PASSWORD = "xxx"; // 改为您的安全密码
    ```
+
 ### 使用方法
 
 #### 访问管理界面
@@ -122,7 +129,7 @@ wrangler deploy
 
 #### 使用 API 代理
 
-将您的应用程序中的 OpenAI API 地址修改为您的 Worker URL，例如：
+将您的应用程序中的 OpenAI API 地址修改为您的 Worker URL，并使用您设置的 API 密钥，例如：
 
 **原始 OpenAI 调用：**
 
@@ -144,11 +151,13 @@ const response = await fetch("https://your-worker-url.workers.dev/v1/chat/comple
   method: "POST",
   headers: {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${ANY_KEY}`, // 这里的密钥值不重要，会被代理替换
+    Authorization: `Bearer sk-yourCustomApiKey123456789`, // 使用您设置的API密钥
   },
   body: JSON.stringify(payload),
 });
 ```
+
+> **重要提示**：必须使用在代码中设置的 API 密钥进行身份验证，否则 API 请求将被拒绝。默认密钥为`sk-yourCustomApiKey123456789`，建议您修改为自己的安全密钥。修改位置在`apipool.js`文件顶部的常量定义区域。
 
 ## 使用提示
 
@@ -166,6 +175,7 @@ const response = await fetch("https://your-worker-url.workers.dev/v1/chat/comple
 3. **自定义**：
    - 可以修改代码中的`MAX_CONSECUTIVE_ERRORS`调整自动禁用的连续错误阈值
    - 调整`KV_SAVE_INTERVAL`和`MAX_PENDING_UPDATES`优化 KV 存储写入频率
+   - 修改`API_KEY`常量来自定义 API 鉴权密钥
 
 ## 故障排除
 
@@ -202,9 +212,10 @@ let logLevel = "info"; // 可选值: debug, info, warn, error
 ## 安全建议
 
 1. 务必修改默认管理员密码
-2. 考虑为 Worker 设置自定义域名，并启用 HTTPS
-3. 定期审查访问日志，监控异常请求
-4. 对重要的 API 密钥设置使用限制
+2. 务必修改默认的 API 鉴权密钥（`sk-yourCustomApiKey123456789`）为更复杂的密钥
+3. 考虑为 Worker 设置自定义域名，并启用 HTTPS
+4. 定期审查访问日志，监控异常请求
+5. 对重要的 API 密钥设置使用限制
 
 ## 许可和贡献
 
