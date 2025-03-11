@@ -8,7 +8,7 @@ const API_ENDPOINTS = {
   models: "/v1/models",
   audio: "/v1/audio/transcriptions",
   userInfo: "/v1/user/info",
-  rerank: "/v1/rerank", 
+  rerank: "/v1/rerank",
 };
 
 const KV_KEYS = {
@@ -43,31 +43,49 @@ let logLevel = "debug"; // debug, info, warn, error
 // 全局统计变量
 let lastKVSaveTime = Date.now();
 let pendingUpdates = 0;
-const KV_SAVE_INTERVAL = 300000; // 每5分钟保存一次
-const MAX_PENDING_UPDATES = 20; // 积累20次更新后强制保存
+// const KV_SAVE_INTERVAL = 300000; // 每5分钟保存一次 - 已弃用，改为实时保存
+// const MAX_PENDING_UPDATES = 20; // 积累20次更新后强制保存 - 已弃用，改为实时保存
+
+// ==================== 缓存配置 ====================
+const CACHE_TTL = {
+  TOKENS: 5 * 60 * 1000, // 令牌缓存5分钟
+  STATS: 2 * 60 * 1000, // 统计数据缓存2分钟
+};
+
+// 缓存对象
+const cache = {
+  tokens: {
+    data: null,
+    timestamp: 0,
+  },
+  stats: {
+    data: null,
+    timestamp: 0,
+  },
+};
 
 // ==================== 日志类 ===================
 class Logger {
   static debug(message, ...args) {
     if (logLevel === "debug") {
-      console.debug(`[DEBUG] ${message}`, ...args);
+      console.debug("[DEBUG] " + message, ...args);
     }
   }
 
   static info(message, ...args) {
     if (logLevel === "debug" || logLevel === "info") {
-      console.info(`[INFO] ${message}`, ...args);
+      console.info("[INFO] " + message, ...args);
     }
   }
 
   static warn(message, ...args) {
     if (logLevel === "debug" || logLevel === "info" || logLevel === "warn") {
-      console.warn(`[WARN] ${message}`, ...args);
+      console.warn("[WARN] " + message, ...args);
     }
   }
 
   static error(message, ...args) {
-    console.error(`[ERROR] ${message}`, ...args);
+    console.error("[ERROR] " + message, ...args);
   }
 }
 
@@ -85,14 +103,28 @@ function releaseDataLock() {
 }
 
 // ==================== 令牌管理函数 ====================
-async function loadTokensFromKV(env) {
+async function loadTokensFromKV(env, forceRefresh = false) {
   try {
+    // 检查缓存是否有效，除非强制刷新
+    const now = Date.now();
+    if (!forceRefresh && cache.tokens.data && now - cache.tokens.timestamp < CACHE_TTL.TOKENS) {
+      tokens = cache.tokens.data;
+      Logger.debug(`使用缓存中的令牌数据，共${tokens.length}个令牌`);
+      return true;
+    }
+
+    // 缓存无效或强制刷新，从KV加载数据
     const data = await env.API_TOKENS.get(KV_KEYS.TOKENS, { type: "json" });
     if (data) {
       tokens = data;
-      Logger.info(`已从KV加载${tokens.length}个令牌`);
+      // 更新缓存
+      cache.tokens.data = data;
+      cache.tokens.timestamp = now;
+      Logger.info(`已从KV加载${tokens.length}个令牌${forceRefresh ? " (强制刷新)" : ""}`);
     } else {
       tokens = [];
+      cache.tokens.data = [];
+      cache.tokens.timestamp = now;
       Logger.info("KV中没有令牌数据，初始化为空数组");
     }
     return true;
@@ -110,7 +142,12 @@ async function saveTokensToKV(env) {
     await acquireDataLock();
 
     await env.API_TOKENS.put(KV_KEYS.TOKENS, JSON.stringify(tokens));
-    Logger.info(`已保存${tokens.length}个令牌到KV`);
+
+    // 更新缓存
+    cache.tokens.data = [...tokens];
+    cache.tokens.timestamp = Date.now();
+
+    Logger.info(`已保存${tokens.length}个令牌到KV并更新缓存`);
 
     releaseDataLock();
     return true;
@@ -464,8 +501,24 @@ function cleanupOldRequestData() {
 }
 
 // 从KV加载统计数据
-async function loadStatsFromKV(env) {
+async function loadStatsFromKV(env, forceRefresh = false) {
   try {
+    // 检查缓存是否有效，除非强制刷新
+    const now = Date.now();
+    if (!forceRefresh && cache.stats.data && now - cache.stats.timestamp < CACHE_TTL.STATS) {
+      const cachedStats = cache.stats.data;
+      requestTimestamps = cachedStats.requestTimestamps || [];
+      tokenCounts = cachedStats.tokenCounts || [];
+      requestTimestampsDay = cachedStats.requestTimestampsDay || [];
+      tokenCountsDay = cachedStats.tokenCountsDay || [];
+
+      // 清理缓存中的旧数据
+      cleanupOldRequestData();
+      Logger.debug("使用缓存中的统计数据");
+      return true;
+    }
+
+    // 缓存无效或强制刷新，从KV加载数据
     const data = await env.API_TOKENS.get(KV_KEYS.STATS, { type: "json" });
     if (data) {
       requestTimestamps = data.requestTimestamps || [];
@@ -473,15 +526,34 @@ async function loadStatsFromKV(env) {
       requestTimestampsDay = data.requestTimestampsDay || [];
       tokenCountsDay = data.tokenCountsDay || [];
 
+      // 更新缓存
+      cache.stats.data = {
+        requestTimestamps: [...requestTimestamps],
+        tokenCounts: [...tokenCounts],
+        requestTimestampsDay: [...requestTimestampsDay],
+        tokenCountsDay: [...tokenCountsDay],
+      };
+      cache.stats.timestamp = now;
+
       // 清理旧数据
       cleanupOldRequestData();
 
-      Logger.info("已从KV加载请求统计数据");
+      Logger.info(`已从KV加载请求统计数据${forceRefresh ? " (强制刷新)" : ""}`);
     } else {
       requestTimestamps = [];
       tokenCounts = [];
       requestTimestampsDay = [];
       tokenCountsDay = [];
+
+      // 更新缓存为空数据
+      cache.stats.data = {
+        requestTimestamps: [],
+        tokenCounts: [],
+        requestTimestampsDay: [],
+        tokenCountsDay: [],
+      };
+      cache.stats.timestamp = now;
+
       Logger.info("KV中没有请求统计数据，初始化为空");
     }
     return true;
@@ -511,19 +583,27 @@ async function saveStatsToKV(env, forceSave = false) {
     // 获取数据锁，防止并发写入
     await acquireDataLock();
 
-    await env.API_TOKENS.put(
-      KV_KEYS.STATS,
-      JSON.stringify({
-        requestTimestamps,
-        tokenCounts,
-        requestTimestampsDay,
-        tokenCountsDay,
-        lastUpdated: new Date().toISOString(),
-      })
-    );
+    const statsData = {
+      requestTimestamps,
+      tokenCounts,
+      requestTimestampsDay,
+      tokenCountsDay,
+      lastUpdated: new Date().toISOString(),
+    };
+
+    await env.API_TOKENS.put(KV_KEYS.STATS, JSON.stringify(statsData));
+
+    // 更新缓存
+    cache.stats.data = {
+      requestTimestamps: [...requestTimestamps],
+      tokenCounts: [...tokenCounts],
+      requestTimestampsDay: [...requestTimestampsDay],
+      tokenCountsDay: [...tokenCountsDay],
+    };
+    cache.stats.timestamp = now;
 
     lastStatsSave = now;
-    Logger.info("已保存请求统计数据到KV");
+    Logger.info("已保存请求统计数据到KV并更新缓存");
     releaseDataLock();
     return true;
   } catch (error) {
@@ -558,7 +638,7 @@ async function updateTokenStats(token, success, tokenCount = 0, env = null) {
       tokens[tokenIndex].lastErrorTime = new Date().toISOString(); // 记录最后错误时间
 
       // 如果连续错误超过阈值，禁用令牌
-      const MAX_CONSECUTIVE_ERRORS = 5; // 自定义修改为您的连续错误次数
+      const MAX_CONSECUTIVE_ERRORS = 3; // 自定义修改为您的连续错误次数
       if (tokens[tokenIndex].consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
         Logger.warn(`令牌 ${obfuscateKey(token.key)} 连续错误${MAX_CONSECUTIVE_ERRORS}次，自动禁用`);
         tokens[tokenIndex].enabled = false;
@@ -582,12 +662,15 @@ async function updateTokenStats(token, success, tokenCount = 0, env = null) {
   cleanupOldRequestData();
 
   // 判断是否需要保存到KV
-  const shouldSave =
-    env &&
-    (pendingUpdates >= MAX_PENDING_UPDATES || // 积累足够多的更新
-      now - lastKVSaveTime >= KV_SAVE_INTERVAL || // 超过时间间隔
-      !success || // 发生错误时立即保存
-      (tokenIndex !== -1 && !tokens[tokenIndex].enabled)); // 令牌被禁用时立即保存
+  const shouldSave = env ? true : false; // 只要有环境变量，就立即保存到KV
+
+  // 旧逻辑：
+  // const shouldSave =
+  //   env &&
+  //   (pendingUpdates >= MAX_PENDING_UPDATES || // 积累足够多的更新
+  //     now - lastKVSaveTime >= KV_SAVE_INTERVAL || // 超过时间间隔
+  //     !success || // 发生错误时立即保存
+  //     (tokenIndex !== -1 && !tokens[tokenIndex].enabled)); // 令牌被禁用时立即保存
 
   if (shouldSave) {
     try {
@@ -595,7 +678,7 @@ async function updateTokenStats(token, success, tokenCount = 0, env = null) {
       await saveStatsToKV(env, true); // 强制保存统计数据
       lastKVSaveTime = now;
       pendingUpdates = 0;
-      Logger.debug(`批量保存统计数据到KV存储，共${pendingUpdates}条更新`);
+      Logger.debug(`实时保存统计数据到KV存储`);
     } catch (error) {
       Logger.error("保存统计数据失败:", error);
     }
@@ -664,8 +747,8 @@ async function handleRequestStats(req, env) {
     // 如果强制刷新，重新加载统计数据和令牌数据
     const forceSave = req.url.includes("force=true");
     if (forceSave) {
-      // 尝试重新加载数据
-      await Promise.all([loadTokensFromKV(env), loadStatsFromKV(env)]);
+      // 尝试重新加载数据，强制从KV读取
+      await Promise.all([loadTokensFromKV(env, true), loadStatsFromKV(env, true)]);
 
       // 重新计算统计
       const refreshedStats = getRequestStats();
@@ -682,6 +765,7 @@ async function handleRequestStats(req, env) {
           success: true,
           stats: refreshedStats,
           refreshed: true,
+          message: "数据已从KV重新加载，缓存已更新",
         },
         200
       );
@@ -1247,11 +1331,97 @@ async function handleTokenManagement(req, env) {
     if (data.action === "add") {
       return jsonResponse(await addTokenToKV(env, data.tokens), 200);
     } else if (data.action === "remove") {
-      const tokenKey = getTokenByIndexOrKey(data.token);
-      return jsonResponse(await removeTokenFromKV(env, tokenKey), 200);
+      if (Array.isArray(data.tokens)) {
+        // 批量删除多个令牌
+        const tokenKeys = data.tokens.map((token) => getTokenByIndexOrKey(token));
+        const results = { success: true, removed: 0, failed: 0, messages: [] };
+
+        if (!acquireDataLock()) {
+          return jsonResponse({ success: false, message: "系统正忙，请稍后再试" }, 429);
+        }
+
+        try {
+          await loadTokensFromKV(env);
+
+          for (const tokenKey of tokenKeys) {
+            try {
+              const result = await removeTokenFromKV(env, tokenKey, true); // 传递skipLock=true，因为我们已经获取了锁
+              if (result.success) {
+                results.removed++;
+              } else {
+                results.failed++;
+                results.messages.push("令牌 [" + obfuscateKey(tokenKey) + "] 删除失败: " + result.message);
+              }
+            } catch (error) {
+              results.failed++;
+              results.messages.push("令牌 [" + obfuscateKey(tokenKey) + "] 删除出错: " + error.message);
+            }
+          }
+
+          await saveTokensToKV(env);
+          results.message = "成功删除 " + results.removed + "/" + tokenKeys.length + " 个令牌";
+          return jsonResponse(results, 200);
+        } finally {
+          releaseDataLock();
+        }
+      } else {
+        // 单个令牌删除
+        const tokenKey = getTokenByIndexOrKey(data.token);
+        return jsonResponse(await removeTokenFromKV(env, tokenKey), 200);
+      }
     } else if (data.action === "toggle") {
-      const tokenKey = getTokenByIndexOrKey(data.token);
-      return jsonResponse(await toggleTokenStatus(env, tokenKey), 200);
+      if (Array.isArray(data.tokens) && typeof data.enable === "boolean") {
+        // 批量切换令牌状态
+        const tokenKeys = data.tokens.map((token) => getTokenByIndexOrKey(token));
+        const results = { success: true, updated: 0, skipped: 0, failed: 0, messages: [] };
+        const targetStatus = data.enable;
+
+        if (!acquireDataLock()) {
+          return jsonResponse({ success: false, message: "系统正忙，请稍后再试" }, 429);
+        }
+
+        try {
+          await loadTokensFromKV(env);
+
+          for (const tokenKey of tokenKeys) {
+            try {
+              // 查找令牌在数组中的位置
+              const tokenIndex = tokens.findIndex((t) => t.key === tokenKey);
+
+              if (tokenIndex === -1) {
+                results.failed++;
+                results.messages.push("找不到令牌 [" + obfuscateKey(tokenKey) + "]");
+                continue;
+              }
+
+              // 检查令牌是否已经处于目标状态
+              if (tokens[tokenIndex].enabled === targetStatus) {
+                results.skipped++;
+                continue;
+              }
+
+              // 切换令牌状态
+              tokens[tokenIndex].enabled = targetStatus;
+              tokens[tokenIndex].lastModified = Date.now();
+              results.updated++;
+            } catch (error) {
+              results.failed++;
+              results.messages.push("令牌 [" + obfuscateKey(tokenKey) + "] 状态更新出错: " + error.message);
+            }
+          }
+
+          await saveTokensToKV(env);
+          const action = targetStatus ? "启用" : "禁用";
+          results.message = "成功" + action + " " + results.updated + "/" + tokenKeys.length + " 个令牌，跳过 " + results.skipped + " 个已" + action + "的令牌";
+          return jsonResponse(results, 200);
+        } finally {
+          releaseDataLock();
+        }
+      } else {
+        // 单个令牌切换
+        const tokenKey = getTokenByIndexOrKey(data.token);
+        return jsonResponse(await toggleTokenStatus(env, tokenKey), 200);
+      }
     } else if (data.action === "refresh_balance") {
       // 查找令牌 - 支持通过索引或密钥查找
       let tokenData;
@@ -1328,8 +1498,11 @@ async function handleTokenManagement(req, env) {
 // 处理令牌列表请求
 async function handleTokenList(req, env) {
   try {
-    // 加载令牌
-    await loadTokensFromKV(env);
+    // 检查是否强制刷新
+    const forceRefresh = req.url.includes("force=true");
+
+    // 加载令牌，传递forceRefresh参数
+    await loadTokensFromKV(env, forceRefresh);
 
     // 混淆API密钥，添加id字段用于前端引用
     const safeTokens = tokens.map((token, index) => ({
@@ -1344,6 +1517,8 @@ async function handleTokenList(req, env) {
         success: true,
         tokens: safeTokens,
         count: tokens.length,
+        refreshed: forceRefresh,
+        message: forceRefresh ? "令牌数据已从KV强制刷新" : undefined,
       },
       200
     );
@@ -2046,6 +2221,44 @@ const dashboardHtml = `
       color: var(--primary-color);
     }
     
+    /* 强制刷新按钮样式 */
+    #refreshStats, #refreshTokens {
+      position: relative;
+      color: #2196F3;
+      font-size: 1.1em;
+    }
+    
+    #refreshStats:hover, #refreshTokens:hover {
+      color: #0D47A1;
+      transform: scale(1.1);
+    }
+    
+    #refreshStats:hover::before {
+      content: "从KV强制刷新统计";
+      position: absolute;
+      top: -30px;
+      right: 0;
+      background: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    
+    #refreshTokens:hover::before {
+      content: "从KV强制刷新令牌";
+      position: absolute;
+      top: -30px;
+      right: 0;
+      background: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    
     .refresh-btn.spinning {
       animation: spin 1s infinite linear;
     }
@@ -2162,8 +2375,8 @@ const dashboardHtml = `
         <h2 class="card-title">
           <i class="bi bi-graph-up me-2"></i>实时统计
         </h2>
-        <span class="refresh-btn" id="refreshStats" title="刷新统计数据">
-          <i class="bi bi-arrow-repeat"></i>
+        <span class="refresh-btn kv-refresh" id="refreshStats" title="从KV刷新数据（忽略缓存）">
+          <i class="bi bi-arrow-clockwise"></i>
         </span>
       </div>
       <div class="stats-container">
@@ -2193,7 +2406,12 @@ const dashboardHtml = `
         <h2 class="card-title">
           <i class="bi bi-key me-2"></i>令牌管理
         </h2>
-        <span class="badge bg-primary" id="tokenCount">0 个令牌</span>
+        <div class="d-flex align-items-center">
+          <span class="refresh-btn kv-refresh" id="refreshTokens" title="从KV刷新令牌数据（忽略缓存）">
+            <i class="bi bi-arrow-clockwise"></i>
+          </span>
+          <span class="badge bg-primary ms-2" id="tokenCount">0 个令牌</span>
+        </div>
       </div>
       
       <!-- 添加令牌表单 -->
@@ -2297,7 +2515,7 @@ const dashboardHtml = `
       refreshStats();
       
       // 设置定时刷新统计数据
-      statsRefreshInterval = setInterval(refreshStats, 30000);
+      statsRefreshInterval = setInterval(refreshStats, 60000);
       
       // 添加令牌表单提交
       document.getElementById('addTokenForm').addEventListener('submit', async function(e) {
@@ -2327,7 +2545,8 @@ const dashboardHtml = `
           if (response.ok) {
             document.getElementById('tokenInput').value = '';
             showAlert(data.message, 'success');
-            refreshTokenList();
+            // 强制从KV刷新令牌列表
+            refreshTokenList(true);
           } else {
             showAlert(data.message || '添加令牌失败', 'danger');
           }
@@ -2343,6 +2562,18 @@ const dashboardHtml = `
         refreshBtn.classList.add('spinning');
         
         refreshStats(true).finally(() => {
+          setTimeout(() => {
+            refreshBtn.classList.remove('spinning');
+          }, 500);
+        });
+      });
+      
+      // 刷新令牌列表按钮点击
+      document.getElementById('refreshTokens').addEventListener('click', function() {
+        const refreshBtn = this;
+        refreshBtn.classList.add('spinning');
+        
+        refreshTokenList(true).finally(() => {
           setTimeout(() => {
             refreshBtn.classList.remove('spinning');
           }, 500);
@@ -2417,9 +2648,10 @@ const dashboardHtml = `
       });
       
       // 刷新令牌列表
-      async function refreshTokenList() {
+      async function refreshTokenList(force = false, suppressMessage = false) {
         try {
-          const response = await fetch('/api/tokens', {
+          const url = force ? '/api/tokens?force=true' : '/api/tokens';
+          const response = await fetch(url, {
             credentials: 'same-origin'
           });
           
@@ -2443,6 +2675,11 @@ const dashboardHtml = `
           
           // 刷新表格
           renderTokenTable();
+          
+          // 如果是强制刷新且返回了消息，且不需要抑制消息显示，则显示通知
+          if (force && data.message && !suppressMessage) {
+            showAlert(data.message, 'success');
+          }
         } catch (error) {
           console.error('Error fetching token list:', error);
           showAlert('获取令牌列表失败，请刷新页面', 'danger');
@@ -2596,9 +2833,19 @@ const dashboardHtml = `
             
             const updatedDate = new Date(data.stats.updated);
             statsUpdated.textContent = "更新时间: " + updatedDate.toLocaleString();
+            
+            // 如果是强制刷新且有消息，显示通知
+            if (force && data.message) {
+              showAlert(data.message, 'success');
+            }
+            
+            return data.stats;
           }
         } catch (error) {
-          console.error('Error fetching stats:', error);
+          console.error('Error refreshing stats:', error);
+          if (force) {
+            showAlert('从KV刷新数据失败，请重试', 'danger');
+          }
         }
       }
       
@@ -2621,7 +2868,8 @@ const dashboardHtml = `
           
           if (response.ok) {
             showAlert(data.message, 'success');
-            refreshTokenList();
+            // 强制从KV刷新令牌列表，抑制默认刷新消息
+            refreshTokenList(true, true);
           } else {
             showAlert(data.message || '操作失败', 'danger');
           }
@@ -2650,7 +2898,8 @@ const dashboardHtml = `
           
           if (response.ok) {
             showAlert(data.message, 'success');
-            refreshTokenList();
+            // 强制从KV刷新令牌列表，抑制默认刷新消息
+            refreshTokenList(true, true);
           } else {
             showAlert(data.message || '删除失败', 'danger');
           }
@@ -2666,60 +2915,46 @@ const dashboardHtml = `
         
         const actionText = enable ? '启用' : '禁用';
         const totalTokens = tokenKeys.length;
-        let processed = 0;
-        let successful = 0;
-        let skipped = 0;
         
-        showAlert("正在" + actionText + "选中的令牌 (0/" + totalTokens + ")...", 'info');
+        showAlert("正在" + actionText + "选中的 " + totalTokens + " 个令牌...", 'info');
         
-        // 逐个处理以避免请求过多
-        for (const tokenKey of tokenKeys) {
-          try {
-            // 找到令牌在数组中的索引
-            const tokenIndex = parseInt(tokenKey);
-            const token = tokens[tokenIndex];
-            
-            // 如果令牌已经处于目标状态，则跳过
-            if ((enable && token.enabled) || (!enable && !token.enabled)) {
-              processed++;
-              skipped++;
-              continue;
-            }
-            
-            const response = await fetch('/api/tokens', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                action: 'toggle',
-                token: tokenKey
-              }),
-              credentials: 'same-origin'
-            });
-            
-            processed++;
-            
-            if (response.ok) {
-              successful++;
-            }
-            
-            // 更新提示
-            if (processed % 5 === 0 || processed === totalTokens) {
-              showAlert("正在" + actionText + "选中的令牌 (" + processed + "/" + totalTokens + ")...", 'info');
-            }
-          } catch (error) {
-            console.error("Error toggling token " + tokenKey + ":", error);
+        try {
+          // 发送批量请求
+          const response = await fetch('/api/tokens', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              action: 'toggle',
+              tokens: tokenKeys,
+              enable: enable
+            }),
+            credentials: 'same-origin'
+          });
+          
+          if (!response.ok) {
+            throw new Error("HTTP error! status: " + response.status);
           }
+          
+          const result = await response.json();
+          
+          if (result.success) {
+            let resultMessage = result.message || "已" + actionText + " " + result.updated + "/" + totalTokens + " 个令牌";
+            if (result.skipped > 0) {
+              resultMessage += " (跳过 " + result.skipped + " 个已" + actionText + "的令牌)";
+            }
+            showAlert(resultMessage, 'success');
+          } else {
+            showAlert(result.message || actionText + "令牌失败", 'danger');
+          }
+        } catch (error) {
+          console.error("批量" + actionText + "令牌出错:", error);
+          showAlert("批量" + actionText + "令牌出错: " + error.message, 'danger');
+        } finally {
+          // 强制从KV刷新令牌列表，抑制默认刷新消息
+          refreshTokenList(true, true);
         }
-        
-        // 完成后刷新
-        let resultMessage = "已" + actionText + " " + successful + "/" + totalTokens + " 个令牌";
-        if (skipped > 0) {
-          resultMessage += " (跳过 " + skipped + " 个已" + actionText + "的令牌)";
-        }
-        showAlert(resultMessage, 'success');
-        refreshTokenList();
       }
       
       // 批量删除令牌
@@ -2727,73 +2962,54 @@ const dashboardHtml = `
         if (tokenKeys.length === 0) return;
 
         const totalTokens = tokenKeys.length;
-        let processed = 0;
-        let successful = 0;
-        let failed = [];
+        
+        showAlert("正在删除选中的 " + totalTokens + " 个令牌...", "info");
 
-        showAlert("正在删除选中的令牌 (0/" + totalTokens + ")...", "info");
-
-        // 获取原始令牌值
-        const tokensToDelete = tokenKeys.map(index => {
-          const token = tokens[parseInt(index)];
-          return token?.originalKey || token?.key;
-        }).filter(key => key); // 过滤掉无效的令牌
-
-        // 分批处理，每批5个
-        const batchSize = 5;
-        for (let i = 0; i < tokensToDelete.length; i += batchSize) {
-          const batch = tokensToDelete.slice(i, i + batchSize);
+        try {
+          // 获取原始令牌值
+          const tokensToDelete = tokenKeys.map(index => {
+            const token = tokens[parseInt(index)];
+            return token?.originalKey || token?.key;
+          }).filter(key => key); // 过滤掉无效的令牌
           
-          // 对每个批次进行处理
-          for (const tokenKey of batch) {
-            try {
-              const response = await fetch("/api/tokens", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                  action: "remove",
-                  token: tokenKey
-                }),
-                credentials: "same-origin"
-              });
-
-              const result = await response.json();
-              processed++;
-
-              if (response.ok && result.success) {
-                successful++;
-              } else {
-                failed.push(tokenKey);
-                console.error("删除令牌失败: " + tokenKey + ", 原因: " + (result.message || "未知错误"));
-              }
-
-              // 更新提示
-              showAlert("正在删除选中的令牌 (" + processed + "/" + totalTokens + ")...", "info");
-            } catch (error) {
-              processed++;
-              failed.push(tokenKey);
-              console.error("删除令牌出错: " + tokenKey + ", 错误: " + error);
+          // 发送批量删除请求
+          const response = await fetch("/api/tokens", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              action: "remove",
+              tokens: tokensToDelete
+            }),
+            credentials: "same-origin"
+          });
+          
+          if (!response.ok) {
+            throw new Error("HTTP error! status: " + response.status);
+          }
+          
+          const result = await response.json();
+          
+          if (result.success) {
+            showAlert(result.message || "成功删除 " + result.removed + "/" + totalTokens + " 个令牌", "success");
+            
+            // 显示详细信息（如果有错误的话）
+            if (result.failed > 0 && result.messages && result.messages.length > 0) {
+              console.warn("删除失败的令牌信息：", result.messages);
             }
+          } else {
+            showAlert(result.message || "批量删除令牌失败", "danger");
           }
-
-          // 每批处理完后稍作等待
-          if (i + batchSize < tokensToDelete.length) {
-            await new Promise(resolve => setTimeout(resolve, 300));
-          }
+        } catch (error) {
+          console.error("批量删除令牌出错:", error);
+          showAlert("批量删除令牌出错: " + error.message, "danger");
+        } finally {
+          // 强制从KV刷新令牌列表，抑制默认刷新消息
+          refreshTokenList(true, true);
+          // 清除选中的令牌
+          clearSelection();
         }
-
-        // 完成后显示结果
-        let message = "已删除 " + successful + "/" + totalTokens + " 个令牌";
-        if (failed.length > 0) {
-          message += "，" + failed.length + " 个令牌删除失败";
-          console.error("删除失败的令牌:", failed);
-        }
-        showAlert(message, successful === totalTokens ? "success" : "warning");
-
-        // 刷新令牌列表
-        refreshTokenList();
       }
       
       // 刷新令牌余额
@@ -2879,6 +3095,9 @@ const dashboardHtml = `
         }
         
         showAlert("已刷新 " + processed + "/" + totalTokens + " 个令牌的余额", 'success');
+        
+        // 强制从KV刷新令牌列表，确保所有余额数据都是最新的，抑制默认刷新消息
+        refreshTokenList(true, true);
       }
       
       // 筛选令牌表格
