@@ -37,6 +37,8 @@ let requestTimestampsDay = [];
 let tokenCountsDay = [];
 // 上次保存统计数据的时间
 let lastStatsSave = Date.now();
+// 记录最后处理的日期(用于按自然日重置每日统计)
+let lastProcessedDate = null;
 // 设置日志级别
 let logLevel = "debug"; // debug, info, warn, error
 
@@ -166,17 +168,31 @@ function getBJTimeString() {
 }
 
 /**
- * 估算文本内容的token数量
- * @param {string} text 要估算的文本
- * @param {boolean} isChatMessage 是否为聊天消息（需要额外计算消息格式开销）
- * @param {string} textType 文本类型，可选值：'normal'(默认), 'image_prompt'
- * @returns {number} 估算的token数量
+ * 估算文本的token数量
+ * @param {string} text - 要估算的文本
+ * @param {boolean} isChatMessage - 是否为聊天消息
+ * @param {string} textType - 文本类型: "normal", "image_prompt", "completion", "code"
+ * @returns {number} - 估算的token数量
  */
 function estimateTokenCount(text, isChatMessage = false, textType = "normal") {
   if (!text) return 0;
 
   // 计算中文字符数和总字符数
   const chineseChars = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+
+  // 计算代码块
+  const codeBlocks = text.match(/```[\s\S]*?```/g) || [];
+  let codeChars = 0;
+  for (const block of codeBlocks) {
+    codeChars += block.length;
+  }
+
+  // 计算ASCII符号字符（标点、数字等）
+  const symbolChars = (text.match(/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?\d]/g) || []).length;
+
+  // 计算空格、换行等空白字符
+  const whitespaceChars = (text.match(/\s/g) || []).length;
+
   const totalChars = text.length;
   const nonChineseChars = totalChars - chineseChars;
 
@@ -190,16 +206,62 @@ function estimateTokenCount(text, isChatMessage = false, textType = "normal") {
       estimatedTokens = Math.ceil(chineseChars * 0.6) + Math.ceil(nonChineseChars / 5);
       break;
 
+    case "code":
+      // 代码文本估算
+      // 代码通常token效率高
+      estimatedTokens = Math.ceil(chineseChars * 0.7) + Math.ceil((nonChineseChars - codeChars) / 4) + Math.ceil(codeChars / 6);
+      break;
+
+    case "completion":
+      // 模型输出的完成内容
+      // 通常模型生成的文本token效率较高，倾向于符合tokenizer的常用词
+      // 中文约0.65 token/字，非中文约0.3 token/字
+      estimatedTokens = Math.ceil(chineseChars * 0.65) + Math.ceil(nonChineseChars / 3.5);
+      // 调整：根据特殊字符比例进一步优化
+      if (symbolChars > totalChars * 0.3) {
+        // 大量标点的文本token率更高
+        estimatedTokens = Math.ceil(estimatedTokens * 1.1);
+      }
+      break;
+
     case "normal":
     default:
       // 普通文本
-      // 中文字符约0.7个token/字，非中文字符约0.25个token/字（4字/token）
-      estimatedTokens = Math.ceil(chineseChars * 0.7) + Math.ceil(nonChineseChars / 4);
+      // 基础估算：中文字符约0.7个token/字，非中文字符约0.25个token/字（4字/token）
+      let baseEstimate = Math.ceil(chineseChars * 0.7) + Math.ceil((nonChineseChars - codeChars) / 4);
+
+      // 代码部分单独计算
+      if (codeChars > 0) {
+        baseEstimate += Math.ceil(codeChars / 5.5);
+      }
+
+      // 调整空白字符的影响
+      if (whitespaceChars > totalChars * 0.2) {
+        // 大量空白字符的文本，token效率更高
+        baseEstimate = Math.ceil(baseEstimate * 0.95);
+      }
+
+      estimatedTokens = baseEstimate;
       break;
   }
 
-  // 如果是聊天消息，添加消息格式开销（约4个token）
-  return isChatMessage ? estimatedTokens + 4 : estimatedTokens;
+  // 添加消息格式开销
+  if (isChatMessage) {
+    // 基础消息格式开销
+    let messageOverhead = 4;
+
+    // 根据文本长度调整，长消息格式开销相对较小
+    if (totalChars > 1000) {
+      messageOverhead = 3;
+    } else if (totalChars < 20) {
+      // 极短消息可能有更高的格式开销比例
+      messageOverhead = 5;
+    }
+
+    estimatedTokens += messageOverhead;
+  }
+
+  return Math.max(1, Math.round(estimatedTokens)); // 确保至少返回1个token
 }
 
 // 添加令牌到KV
@@ -473,30 +535,38 @@ function cleanupOldRequestData() {
       Logger.warn(`天级统计数据长度不一致，已调整为${minDayLength}`);
     }
 
-    // 清理过期数据
+    // 获取当前日期（按北京时间）
+    const bjTimeString = getBJTimeString(); // 使用现有函数获取北京时间
+    const beijingDateStr = bjTimeString.substring(0, 10); // 截取YYYY-MM-DD部分
+
+    // 重置逻辑：如果有上一次的日期记录且与当前日期不同，则重置天级数据
+    if (lastProcessedDate && lastProcessedDate !== beijingDateStr) {
+      Logger.info(`日期已变更：${lastProcessedDate} -> ${beijingDateStr}，重置每日统计数据`);
+      requestTimestampsDay = [];
+      tokenCountsDay = [];
+      dayCleanupCount = "全部重置";
+    }
+
+    // 记录当前处理的日期
+    lastProcessedDate = beijingDateStr;
+
+    // 原有的清理逻辑（清理超过24小时的数据）
     for (let i = requestTimestampsDay.length - 1; i >= 0; i--) {
       if (now - requestTimestampsDay[i] > ONE_DAY) {
         requestTimestampsDay.splice(0, i + 1);
         tokenCountsDay.splice(0, i + 1);
-        dayCleanupCount = i + 1;
+        if (dayCleanupCount !== "全部重置") {
+          dayCleanupCount = i + 1;
+        }
         break;
       }
     }
 
-    if (dayCleanupCount > 0) {
+    if (dayCleanupCount) {
       Logger.debug(`清理了${dayCleanupCount}条天级统计数据`);
     }
   } catch (error) {
     Logger.error("清理统计数据时出错:", error);
-    // 出错时重置数组，防止数据不一致
-    if (requestTimestamps.length !== tokenCounts.length) {
-      requestTimestamps = [];
-      tokenCounts = [];
-    }
-    if (requestTimestampsDay.length !== tokenCountsDay.length) {
-      requestTimestampsDay = [];
-      tokenCountsDay = [];
-    }
   }
 }
 
@@ -511,6 +581,7 @@ async function loadStatsFromKV(env, forceRefresh = false) {
       tokenCounts = cachedStats.tokenCounts || [];
       requestTimestampsDay = cachedStats.requestTimestampsDay || [];
       tokenCountsDay = cachedStats.tokenCountsDay || [];
+      lastProcessedDate = cachedStats.lastProcessedDate || null;
 
       // 清理缓存中的旧数据
       cleanupOldRequestData();
@@ -525,6 +596,7 @@ async function loadStatsFromKV(env, forceRefresh = false) {
       tokenCounts = data.tokenCounts || [];
       requestTimestampsDay = data.requestTimestampsDay || [];
       tokenCountsDay = data.tokenCountsDay || [];
+      lastProcessedDate = data.lastProcessedDate || null;
 
       // 更新缓存
       cache.stats.data = {
@@ -532,6 +604,7 @@ async function loadStatsFromKV(env, forceRefresh = false) {
         tokenCounts: [...tokenCounts],
         requestTimestampsDay: [...requestTimestampsDay],
         tokenCountsDay: [...tokenCountsDay],
+        lastProcessedDate: lastProcessedDate,
       };
       cache.stats.timestamp = now;
 
@@ -545,12 +618,16 @@ async function loadStatsFromKV(env, forceRefresh = false) {
       requestTimestampsDay = [];
       tokenCountsDay = [];
 
+      // 初始化最后处理日期
+      lastProcessedDate = getBJTimeString().substring(0, 10); // 使用现有函数，截取YYYY-MM-DD部分
+
       // 更新缓存为空数据
       cache.stats.data = {
         requestTimestamps: [],
         tokenCounts: [],
         requestTimestampsDay: [],
         tokenCountsDay: [],
+        lastProcessedDate: lastProcessedDate,
       };
       cache.stats.timestamp = now;
 
@@ -588,6 +665,7 @@ async function saveStatsToKV(env, forceSave = false) {
       tokenCounts,
       requestTimestampsDay,
       tokenCountsDay,
+      lastProcessedDate,
       lastUpdated: new Date().toISOString(),
     };
 
@@ -599,6 +677,7 @@ async function saveStatsToKV(env, forceSave = false) {
       tokenCounts: [...tokenCounts],
       requestTimestampsDay: [...requestTimestampsDay],
       tokenCountsDay: [...tokenCountsDay],
+      lastProcessedDate: lastProcessedDate,
     };
     cache.stats.timestamp = now;
 
@@ -946,6 +1025,22 @@ async function checkTokenBalance(token, forceRefresh = false) {
     });
 
     if (!response.ok) {
+      // 如果获取余额失败，检查token是否有效
+      const isValid = await checkTokenValidity(token);
+
+      if (tokenIndex !== -1) {
+        tokens[tokenIndex].balance = null;
+        tokens[tokenIndex].isValid = isValid;
+        tokens[tokenIndex].lastChecked = new Date().toISOString();
+
+        try {
+          await saveTokensToKV(env);
+          Logger.info(`已保存令牌 ${obfuscateKey(token)} 的状态更新到 KV`);
+        } catch (error) {
+          Logger.error(`保存令牌状态到 KV 失败: ${error}`);
+        }
+      }
+
       return null;
     }
 
@@ -954,6 +1049,7 @@ async function checkTokenBalance(token, forceRefresh = false) {
     // 更新令牌余额信息 - 从data.data.totalBalance中获取余额
     if (tokenIndex !== -1) {
       tokens[tokenIndex].balance = (data.data && data.data.totalBalance) || null;
+      tokens[tokenIndex].isValid = true; // 成功获取余额，标记为有效
       tokens[tokenIndex].lastChecked = new Date().toISOString();
 
       // 保存更新后的令牌数据到 KV
@@ -968,7 +1064,49 @@ async function checkTokenBalance(token, forceRefresh = false) {
     return (data.data && data.data.totalBalance) || null;
   } catch (error) {
     Logger.error(`检查令牌余额失败: ${error}`);
+
+    // 如果出错，尝试检查token有效性
+    if (tokenIndex !== -1) {
+      const isValid = await checkTokenValidity(token);
+      tokens[tokenIndex].isValid = isValid;
+      tokens[tokenIndex].lastChecked = new Date().toISOString();
+
+      try {
+        await saveTokensToKV(env);
+      } catch (saveError) {
+        Logger.error(`保存令牌状态到 KV 失败: ${saveError}`);
+      }
+    }
+
     return null;
+  }
+}
+
+// 检查令牌有效性
+async function checkTokenValidity(token) {
+  if (!token) return false;
+
+  try {
+    // 请求免费模型验证token是否有效
+    const response = await fetch("https://api.siliconflow.cn/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + token,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "Qwen/Qwen2.5-7B-Instruct",
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 100,
+        stream: false,
+      }),
+    });
+
+    // 如果响应成功，token有效
+    return response.ok;
+  } catch (error) {
+    Logger.error(`检查令牌有效性失败: ${error}`);
+    return false;
   }
 }
 
@@ -1053,6 +1191,19 @@ async function handleApiRequest(req, path, headers, env) {
     }
   }
 
+  // 检查是否为流式请求
+  const isStreamRequest = (() => {
+    try {
+      if (requestBody && typeof requestBody === "string") {
+        const requestJson = JSON.parse(requestBody);
+        return requestJson.stream === true;
+      }
+    } catch (e) {
+      // 解析失败，假设不是流式请求
+    }
+    return false;
+  })();
+
   // 重试逻辑
   const MAX_RETRIES = 3; // 自定义修改为您的重试次数
   const RETRY_DELAY_MS = 500;
@@ -1089,6 +1240,65 @@ async function handleApiRequest(req, path, headers, env) {
       // 发送请求
       const response = await fetch(url, requestOptions);
 
+      // 如果是流式请求，处理流式响应
+      if (isStreamRequest && response.ok) {
+        Logger.info(`开始处理流式响应: 路径=${path}, 状态=${response.status}, 令牌=${obfuscateKey(token.key)}`);
+
+        // 自定义延迟算法的配置
+        const streamConfig = {
+          minDelay: 3, // 最小延迟(毫秒)，降低以提高响应速度
+          maxDelay: 30, // 最大延迟(毫秒)，减小以提高整体流畅性
+          adaptiveDelayFactor: 0.5, // 自适应延迟因子
+          chunkBufferSize: 15, // 增大计算平均响应大小的缓冲区
+          minContentLengthForFastOutput: 500, // 降低启用快速输出的阈值
+          fastOutputDelay: 2, // 快速输出时的固定延迟，降低以加快输出
+          finalLowDelay: 1, // 模型完成响应后的低延迟
+          interMessageDelay: 5, // 消息之间的延迟时间
+          fastModeThreshold: 3000, // 大内容自动启用快速模式的阈值
+          intelligentBatching: true, // 启用智能批处理
+          maxBatchSize: 5, // 最大批处理大小
+          collectCompletionText: true, // 启用响应内容收集以准确计算token
+          // 添加更新统计信息的回调函数
+          updateStatsCallback: async (completionTokens) => {
+            try {
+              // 初始token估算（提示部分）
+              const promptTokens = await estimateTokenUsageFromRequest(requestBody, path);
+
+              // 计算总token使用量
+              const totalTokens = promptTokens + completionTokens;
+
+              Logger.info(`流式响应完成: 路径=${path}, 令牌=${obfuscateKey(token.key)}, ` + `总Token=${totalTokens} (提示: ${promptTokens}, 完成: ${completionTokens})`);
+
+              // 更新token统计信息
+              await updateTokenStats(token, true, totalTokens, env);
+            } catch (e) {
+              Logger.warn(`更新流式响应token统计失败: ${e.message}`);
+            }
+          },
+        };
+
+        // 创建转换流
+        const { readable, writable } = new TransformStream();
+
+        // 初始token估算（仅用于临时记录）
+        const initialTokenUsage = await estimateTokenUsageFromRequest(requestBody, path);
+        Logger.debug(`流式请求初始token估算: ${initialTokenUsage}`);
+
+        // 处理流式响应 - 不在此处立即更新统计信息，而是在流结束后由回调更新
+        processStreamingResponse(response.body, writable, streamConfig);
+
+        // 返回流式响应
+        return new Response(readable, {
+          status: response.status,
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          },
+        });
+      }
+
+      // 非流式响应处理 - 保持现有代码
       // 读取响应数据
       const responseText = await response.text();
       let responseData;
@@ -1308,6 +1518,436 @@ async function handleApiRequest(req, path, headers, env) {
   }
 }
 
+// 根据请求估算Token使用量，用于流式请求的初始统计
+async function estimateTokenUsageFromRequest(requestBody, path) {
+  try {
+    if (!requestBody) return 10;
+
+    let requestJson;
+    try {
+      requestJson = JSON.parse(requestBody);
+    } catch (e) {
+      // 非JSON请求体，使用字符长度估算
+      return Math.max(10, Math.ceil(requestBody.length / 3));
+    }
+
+    // 处理不同类型的JSON请求
+    if (requestJson.messages && Array.isArray(requestJson.messages)) {
+      // 聊天请求的估算
+      let tokenCount = 0;
+
+      // 计算所有消息的token
+      requestJson.messages.forEach((msg) => {
+        if (msg.content) {
+          // 检测消息内容是否包含代码块
+          const hasCodeBlock = String(msg.content).includes("```");
+          const textType = hasCodeBlock ? "code" : "normal";
+          tokenCount += estimateTokenCount(String(msg.content), true, textType);
+        }
+
+        // 计算消息角色开销 (约2-3个token)
+        tokenCount += 3;
+      });
+
+      // 添加聊天格式开销 (约8-10个token)
+      tokenCount += 10;
+
+      return tokenCount;
+    } else if (requestJson.input || requestJson.prompt) {
+      // 处理单一输入请求
+      const input = String(requestJson.input || requestJson.prompt || "");
+
+      // 检测请求路径或内容特性，选择合适的文本类型
+      let textType = "normal";
+
+      if (path && path.includes("/images/")) {
+        textType = "image_prompt";
+      } else if (input.includes("```")) {
+        textType = "code";
+      }
+
+      return estimateTokenCount(input, false, textType);
+    } else if (path && path.includes("/embeddings")) {
+      // 嵌入请求的特殊处理
+      let input = "";
+      if (requestJson.input) {
+        if (Array.isArray(requestJson.input)) {
+          // 多个输入文本
+          input = requestJson.input.join(" ");
+        } else {
+          input = String(requestJson.input);
+        }
+      }
+      return estimateTokenCount(input, false, "normal");
+    } else {
+      // 其他JSON请求
+      const jsonLength = JSON.stringify(requestJson).length;
+      return Math.max(10, Math.ceil(jsonLength / 4));
+    }
+  } catch (e) {
+    Logger.warn(`流式请求Token估算出错: ${e.message}`);
+    return 100; // 默认值
+  }
+}
+
+// 处理流式响应，添加自适应延迟
+async function processStreamingResponse(inputStream, outputStream, config) {
+  const reader = inputStream.getReader();
+  const writer = outputStream.getWriter();
+
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+
+  // 优化缓冲区管理
+  let buffer = "";
+  let lastChunkTime = Date.now();
+  let recentChunkSizes = [];
+  let currentDelay = config.minDelay;
+  let contentReceived = false;
+  let isStreamEnding = false;
+  let totalContentReceived = 0;
+  let isFirstChunk = true;
+
+  // Token计算增强: 跟踪累积的响应内容
+  let allResponseContent = "";
+  let completionTokens = 0;
+  let lastDeltaContent = "";
+
+  // 添加对话历史收集
+  let collectCompletionText = config.collectCompletionText === true;
+  let lastChoice = null;
+
+  try {
+    Logger.debug("开始处理流式响应");
+
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) {
+        Logger.debug("流读取完成");
+        isStreamEnding = true;
+        if (buffer.length > 0) {
+          await processBuffer(buffer, writer, encoder, isStreamEnding, {
+            ...config,
+            currentDelay: config.finalLowDelay || 1,
+          });
+        }
+        await writer.write(encoder.encode("data: [DONE]\n\n"));
+
+        // 流结束后，基于累积的内容更新token计数
+        if (collectCompletionText && allResponseContent.length > 0) {
+          completionTokens = estimateTokenCount(allResponseContent);
+          Logger.debug(`流响应结束，估算完成部分token数: ${completionTokens}`);
+
+          // 更新token使用统计
+          if (config.updateStatsCallback && typeof config.updateStatsCallback === "function") {
+            config.updateStatsCallback(completionTokens);
+          }
+        }
+        break;
+      }
+
+      if (value && value.length) {
+        const chunk = decoder.decode(value, { stream: true });
+        buffer += chunk;
+
+        // 计算延迟和性能指标
+        const currentTime = Date.now();
+        const timeSinceLastChunk = currentTime - lastChunkTime;
+        lastChunkTime = currentTime;
+
+        // 跟踪接收的数据
+        contentReceived = true;
+        totalContentReceived += chunk.length;
+
+        // 管理最近块大小的历史记录
+        recentChunkSizes.push(chunk.length);
+        if (recentChunkSizes.length > config.chunkBufferSize) {
+          recentChunkSizes.shift();
+        }
+
+        // 优化的SSE消息处理 - 使用双换行符作为消息分隔符
+        const messages = buffer.split("\n\n");
+        buffer = messages.pop() || ""; // 保留最后一部分可能不完整的消息
+
+        // 处理完整的消息
+        for (const message of messages) {
+          if (!message.trim()) continue;
+
+          // 提取并跟踪内容以改进token计算
+          if (collectCompletionText) {
+            try {
+              if (message.startsWith("data:")) {
+                const jsonContent = message.substring(5).trim();
+                if (jsonContent !== "[DONE]") {
+                  const jsonData = JSON.parse(jsonContent);
+                  if (jsonData.choices && jsonData.choices.length > 0) {
+                    lastChoice = jsonData.choices[0];
+                    if (lastChoice.delta && lastChoice.delta.content) {
+                      // 收集所有内容以用于最终token计算
+                      lastDeltaContent = lastChoice.delta.content;
+                      allResponseContent += lastDeltaContent;
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              // 解析错误，忽略此消息的token计算
+              Logger.debug(`无法解析消息进行token累积: ${e.message}`);
+            }
+          }
+
+          const lines = message.split("\n");
+          for (const line of lines) {
+            if (line.trim()) {
+              // 为第一个内容快使用更快的延迟以提高感知响应速度
+              const useDelay = isFirstChunk ? Math.min(config.minDelay, 2) : currentDelay;
+              isFirstChunk = false;
+
+              await processLine(line, writer, encoder, useDelay, config, false);
+            }
+          }
+
+          // 消息之间添加小延迟使输出更自然
+          if (config.interMessageDelay) {
+            await new Promise((r) => setTimeout(r, config.interMessageDelay));
+          }
+        }
+
+        // 动态调整延迟
+        const avgChunkSize = recentChunkSizes.reduce((sum, size) => sum + size, 0) / recentChunkSizes.length;
+        currentDelay = adaptDelay(avgChunkSize, timeSinceLastChunk, config, false);
+
+        // 大内容启用快速处理模式
+        if (totalContentReceived > (config.fastModeThreshold || 5000)) {
+          currentDelay = Math.min(currentDelay, config.fastOutputDelay || 3);
+        }
+      }
+    }
+  } catch (error) {
+    Logger.error("处理流式响应时出错:", error);
+    try {
+      // 发送格式化的错误响应
+      const errorResponse = {
+        error: {
+          message: error.message,
+          type: "stream_processing_error",
+        },
+      };
+      await writer.write(encoder.encode(`data: ${JSON.stringify(errorResponse)}\n\n`));
+    } catch (e) {
+      Logger.error("写入错误响应失败:", e);
+    }
+  } finally {
+    try {
+      await writer.close();
+    } catch (e) {
+      Logger.error("关闭写入器失败:", e);
+    }
+  }
+
+  // 返回token使用情况
+  return {
+    completionTokens,
+    totalContent: allResponseContent,
+  };
+}
+
+// 处理单行SSE数据
+async function processLine(line, writer, encoder, delay, config, isStreamEnding) {
+  if (!line.trim() || !line.startsWith("data:")) return;
+
+  try {
+    // 去除前缀，解析JSON
+    const content = line.substring(5).trim();
+    if (content === "[DONE]") {
+      await writer.write(encoder.encode(`${line}\n\n`));
+      return;
+    }
+
+    try {
+      const jsonData = JSON.parse(content);
+
+      // OpenAI流式格式处理
+      if (jsonData.choices && Array.isArray(jsonData.choices)) {
+        const choice = jsonData.choices[0];
+
+        if (choice.delta && choice.delta.content) {
+          const deltaContent = choice.delta.content;
+          const contentLength = deltaContent.length;
+
+          // 针对不同长度的内容使用不同策略
+          if (contentLength > 20 && !isStreamEnding && config.intelligentBatching) {
+            // 长内容分批处理
+            await sendContentInBatches(deltaContent, jsonData, writer, encoder, delay, config);
+          } else {
+            // 短内容或结束时的内容直接处理
+            await sendContentCharByChar(deltaContent, jsonData, writer, encoder, delay, config, isStreamEnding);
+          }
+          return;
+        } else if (choice.delta && Object.keys(choice.delta).length === 0) {
+          // 这可能是最后一个消息或控制消息
+          await writer.write(encoder.encode(`${line}\n\n`));
+          return;
+        }
+      }
+    } catch (e) {
+      // JSON解析失败，按原始内容处理
+      Logger.debug(`非标准JSON内容: ${e.message}`);
+    }
+
+    // 按原样发送未能识别的内容
+    await writer.write(encoder.encode(`${line}\n\n`));
+  } catch (error) {
+    Logger.error(`处理SSE行时出错: ${error.message}`);
+    try {
+      // 出错时尝试按原样发送
+      await writer.write(encoder.encode(`${line}\n\n`));
+    } catch (e) {
+      // 忽略二次错误
+    }
+  }
+}
+
+// 处理缓冲数据
+async function processBuffer(buffer, writer, encoder, isStreamEnding, config) {
+  if (!buffer.trim()) return;
+
+  // 拆分成行并处理每一行
+  const lines = buffer.split("\n");
+
+  // 为流结束和中间内容使用不同的延迟
+  const delay = isStreamEnding ? config.finalLowDelay || 1 : config.currentDelay || config.minDelay;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+
+    // 对最后一行使用流结束标志
+    const isLastLine = i === lines.length - 1;
+    await processLine(line, writer, encoder, delay, config, isLastLine && isStreamEnding);
+  }
+}
+
+// 自适应延迟算法
+function adaptDelay(chunkSize, timeSinceLastChunk, config, isStreamEnding) {
+  if (chunkSize <= 0) return config.minDelay;
+
+  // 流结束时使用finalLowDelay
+  if (isStreamEnding && config.finalLowDelay !== undefined) {
+    return Math.max(1, config.finalLowDelay);
+  }
+
+  // 确保配置值有效
+  const minDelay = Math.max(1, config.minDelay || 5);
+  const maxDelay = Math.max(minDelay, config.maxDelay || 40);
+  const adaptiveDelayFactor = Math.max(0, Math.min(2, config.adaptiveDelayFactor || 0.5));
+
+  // 改进的延迟计算
+
+  // 1. 基于块大小的因子（块越大，延迟越小）
+  // 使用对数缩放提供更平滑的过渡
+  const logChunkSize = Math.log2(Math.max(1, chunkSize));
+  const sizeScaleFactor = Math.max(0.2, Math.min(1.5, 4 / logChunkSize));
+
+  // 2. 基于时间间隔的因子（时间间隔越长，延迟越大）
+  // 如果LLM响应慢，我们也应该放慢输出速度使其更自然
+  const timeScaleFactor = Math.sqrt(Math.min(2000, Math.max(50, timeSinceLastChunk)) / 200);
+
+  // 3. 计算最终延迟
+  let delay = minDelay + (maxDelay - minDelay) * sizeScaleFactor * timeScaleFactor * adaptiveDelayFactor;
+
+  // 添加轻微随机变化（±10%）以使输出更自然
+  const randomFactor = 0.9 + Math.random() * 0.2;
+  delay *= randomFactor;
+
+  // 确保在允许范围内
+  return Math.min(maxDelay, Math.max(minDelay, delay));
+}
+
+// 逐字符发送内容
+async function sendContentCharByChar(content, originalJson, writer, encoder, delay, config, isStreamEnding) {
+  if (!content) return;
+
+  // 检查是否需要快速输出模式
+  const useQuickMode = content.length > (config.minContentLengthForFastOutput || 1000);
+  const actualDelay = useQuickMode ? config.fastOutputDelay || 2 : delay;
+
+  try {
+    // 对于长内容优化批处理大小
+    const sendBatchSize = useQuickMode
+      ? isStreamEnding
+        ? 5
+        : 3 // 流结束时可以发送更大的批次
+      : 1;
+
+    for (let i = 0; i < content.length; i += sendBatchSize) {
+      const endIndex = Math.min(i + sendBatchSize, content.length);
+      const currentBatch = content.substring(i, endIndex);
+
+      // 将原始JSON中的内容替换为当前字符
+      const modifiedJson = JSON.parse(JSON.stringify(originalJson));
+      modifiedJson.choices[0].delta.content = currentBatch;
+
+      // 写入当前字符的SSE行
+      const modifiedLine = `data: ${JSON.stringify(modifiedJson)}\n\n`;
+      await writer.write(encoder.encode(modifiedLine));
+
+      // 添加延迟，除了最后一批和极小内容（如单个标点符号）
+      if (i + sendBatchSize < content.length && currentBatch.length > 1) {
+        // 为流结束的最后部分使用更短的延迟
+        const finalDelay = isStreamEnding && content.length - i < 10 ? Math.min(actualDelay, config.finalLowDelay || 1) : actualDelay;
+        await new Promise((resolve) => setTimeout(resolve, finalDelay));
+      }
+    }
+  } catch (error) {
+    Logger.error(`逐字符发送内容时出错: ${error.message}`);
+    // 出错时，尝试发送完整内容
+    try {
+      await writer.write(encoder.encode(`data: ${JSON.stringify(originalJson)}\n\n`));
+    } catch (e) {
+      Logger.error(`无法发送完整内容: ${e.message}`);
+    }
+  }
+}
+
+// 分批次发送内容，优化长内容的处理
+async function sendContentInBatches(content, originalJson, writer, encoder, delay, config) {
+  if (!content || content.length === 0) return;
+
+  // 根据内容长度和配置选择批处理大小
+  const batchSize = content.length > 100 ? config.maxBatchSize || 5 : content.length > 50 ? 3 : 2;
+
+  // 根据内容长度动态调整延迟
+  const adjustedDelay = content.length > 100 ? Math.min(delay, config.fastOutputDelay || 3) : delay;
+
+  try {
+    for (let i = 0; i < content.length; i += batchSize) {
+      const endIndex = Math.min(i + batchSize, content.length);
+      const batch = content.substring(i, endIndex);
+
+      // 创建新的JSON对象，只包含当前批次
+      const batchJson = JSON.parse(JSON.stringify(originalJson));
+      batchJson.choices[0].delta.content = batch;
+
+      // 发送当前批次
+      const batchLine = `data: ${JSON.stringify(batchJson)}\n\n`;
+      await writer.write(encoder.encode(batchLine));
+
+      // 只在批次之间添加延迟，最后一批不添加
+      if (i + batchSize < content.length) {
+        await new Promise((r) => setTimeout(r, adjustedDelay));
+      }
+    }
+  } catch (error) {
+    Logger.error(`分批处理内容时出错: ${error.message}`);
+    // 出错时发送完整内容
+    const fallbackJson = JSON.parse(JSON.stringify(originalJson));
+    fallbackJson.choices[0].delta.content = content;
+    await writer.write(encoder.encode(`data: ${JSON.stringify(fallbackJson)}\n\n`));
+  }
+}
+
 // ==================== 令牌管理API ====================
 // 处理令牌管理请求
 async function handleTokenManagement(req, env) {
@@ -1451,18 +2091,25 @@ async function handleTokenManagement(req, env) {
       const balance = await checkTokenBalance(tokenKey, true);
       Logger.info(`令牌余额查询结果: ${balance !== null ? balance : "查询失败"}`);
 
+      // 检查token是否有效
+      let isValid = true;
+      if (balance === null) {
+        // 如果无法获取余额，检查token有效性
+        isValid = await checkTokenValidity(tokenKey);
+        Logger.info(`令牌有效性检查结果: ${isValid ? "有效" : "无效"}`);
+      }
+
       // 更新令牌数据并保存到 KV
-      if (balance !== null) {
-        const idx = tokens.findIndex((t) => t.key === tokenKey);
-        if (idx !== -1) {
-          tokens[idx].balance = balance;
-          tokens[idx].lastChecked = new Date().toISOString();
-          try {
-            await saveTokensToKV(env);
-            Logger.info(`已保存令牌 ${obfuscateKey(tokenKey)} 的余额更新到 KV`);
-          } catch (error) {
-            Logger.error(`保存令牌余额到 KV 失败: ${error}`);
-          }
+      const idx = tokens.findIndex((t) => t.key === tokenKey);
+      if (idx !== -1) {
+        tokens[idx].balance = balance;
+        tokens[idx].isValid = isValid;
+        tokens[idx].lastChecked = new Date().toISOString();
+        try {
+          await saveTokensToKV(env);
+          Logger.info(`已保存令牌 ${obfuscateKey(tokenKey)} 的余额和有效性更新到 KV`);
+        } catch (error) {
+          Logger.error(`保存令牌数据到 KV 失败: ${error}`);
         }
       }
 
@@ -1470,6 +2117,7 @@ async function handleTokenManagement(req, env) {
         {
           success: true,
           balance: balance,
+          isValid: isValid,
           token: obfuscateKey(tokenKey),
         },
         200
@@ -1972,7 +2620,7 @@ const loginHtml = `
   </div>
   
   <script>
-    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+    document.getElementById('loginForm').addEventListener('submit', async function(e) {
       e.preventDefault();
       
       const password = document.getElementById('password').value;
@@ -2010,7 +2658,7 @@ const loginHtml = `
           errorMessage.style.color = '#4CAF50';
           
           // 延迟跳转以显示成功消息
-          setTimeout(() => {
+          setTimeout(function() {
             window.location.href = '/dashboard';
           }, 1000);
         } else {
@@ -2059,6 +2707,22 @@ const dashboardHtml = `
       color: var(--text-color);
       min-height: 100vh;
       padding-bottom: 40px;
+    }
+    
+    /* 余额显示状态样式 */
+    .balance-ok {
+      color: var(--success-color);
+      font-weight: bold;
+    }
+    
+    .balance-low {
+      color: var(--warning-color);
+      font-weight: bold;
+    }
+    
+    .balance-invalid {
+      color: var(--error-color);
+      font-weight: bold;
     }
     
     .navbar {
@@ -2440,7 +3104,7 @@ const dashboardHtml = `
           <button type="button" id="refreshBalanceBtn" class="btn btn-info btn-sm text-white" disabled>
             <i class="bi bi-currency-exchange me-1"></i>刷新余额
           </button>
-          <div class="ms-auto">
+          <div class="ms-auto d-flex gap-2">
             <div class="input-group">
               <input type="text" class="form-control form-control-sm" id="tokenSearch" placeholder="搜索令牌...">
               <button type="button" id="clearSearchBtn" class="btn btn-outline-secondary btn-sm">
@@ -2514,7 +3178,7 @@ const dashboardHtml = `
       refreshTokenList();
       refreshStats();
       
-      // 设置定时刷新统计数据
+      // 每60秒刷新一次统计数据
       statsRefreshInterval = setInterval(refreshStats, 60000);
       
       // 添加令牌表单提交
@@ -2697,8 +3361,22 @@ const dashboardHtml = `
         
         emptyTokenMessage.classList.add('d-none');
         
-        tokens.forEach((token, index) => {
+        tokens.forEach(function(token, index) {
           const row = document.createElement('tr');
+          
+          // 设置余额状态的CSS类
+          let balanceStatusClass = '';
+          if (token.isValid === false) {
+            // 红色：token无效
+            balanceStatusClass = 'balance-invalid';
+          } else if (token.balance !== null && token.balance <= 0) {
+            // 黄色：余额不足
+            balanceStatusClass = 'balance-low';
+          } else if (token.balance !== null && token.balance > 0) {
+            // 绿色：余额正常
+            balanceStatusClass = 'balance-ok';
+          }
+          
           row.innerHTML = 
             '<td>' +
               '<input class="form-check-input token-checkbox" type="checkbox" data-token="' + index + '">' +
@@ -2716,7 +3394,7 @@ const dashboardHtml = `
               '</span>' +
             '</td>' +
             '<td>' +
-              '<span class="balance-display" id="balance-' + index + '">' +
+              '<span class="balance-display ' + balanceStatusClass + '" id="balance-' + index + '">' +
                 (token.balance !== null ? token.balance : '-') +
               '</span>' +
               '<span class="refresh-btn refresh-balance" data-token="' + index + '" data-index="' + index + '" title="刷新余额">' +
@@ -3012,7 +3690,53 @@ const dashboardHtml = `
         }
       }
       
-      // 刷新令牌余额
+      // 批量刷新余额
+      async function batchRefreshBalance(tokenKeys) {
+        if (tokenKeys.length === 0) return;
+        
+        const totalTokens = tokenKeys.length;
+        showAlert("正在并发刷新选中令牌的余额 (0/" + totalTokens + ")...", 'info');
+        
+        // 自定义设置最大并发数
+        const MAX_CONCURRENT = 20; // 最多同时发起20个请求
+        let processed = 0;
+        let successCount = 0;
+        
+        // 使用分批处理方式
+        for (let i = 0; i < totalTokens; i += MAX_CONCURRENT) {
+          // 获取当前批次的令牌
+          const batch = tokenKeys.slice(i, i + MAX_CONCURRENT);
+          const batchPromises = batch.map(function(tokenIndex) {
+            // 将字符串索引转换为数字
+            const index = parseInt(tokenIndex);
+            if (index >= 0 && index < tokens.length) {
+              return refreshTokenBalance(index, index)
+                .then(function(result) {
+                  if (result && result.success) successCount++;
+                  return result;
+                })
+                .catch(function(error) {
+                  console.error("刷新令牌 " + index + " 余额失败:", error);
+                  return { success: false, error: error };
+                });
+            }
+            return Promise.resolve({ success: false, error: '无效索引' });
+          });
+          
+          // 并发执行当前批次
+          await Promise.all(batchPromises);
+          
+          processed += batch.length;
+          showAlert("正在并发刷新选中令牌的余额 (" + processed + "/" + totalTokens + ")...", 'info');
+        }
+        
+        showAlert("已刷新 " + successCount + "/" + totalTokens + " 个令牌的余额", 'success');
+        
+        // 强制从KV刷新令牌列表，确保所有余额数据都是最新的，抑制默认刷新消息
+        refreshTokenList(true, true);
+      }
+      
+      // 刷新令牌余额 - 修改为返回Promise以支持批量并发
       async function refreshTokenBalance(tokenKey, index) {
         const balanceElement = document.getElementById("balance-" + index);
         const refreshBtn = balanceElement.nextElementSibling;
@@ -3021,14 +3745,11 @@ const dashboardHtml = `
         balanceElement.textContent = '加载中...';
         refreshBtn.classList.add('spinning');
         
-        console.log('准备刷新令牌余额: key=' + tokenKey + ', index=' + index);
-        
         try {
           const requestData = {
             action: 'refresh_balance',
             token: tokenKey
           };
-          console.log('发送请求数据:', requestData);
           
           const response = await fetch('/api/tokens', {
             method: 'POST',
@@ -3046,58 +3767,53 @@ const dashboardHtml = `
           if (response.ok && data.success) {
             balanceElement.textContent = data.balance !== null ? data.balance : '-';
             
+            // 更新余额显示的样式类
+            balanceElement.classList.remove('balance-ok', 'balance-low', 'balance-invalid');
+            
+            if (data.isValid === false) {
+              // 红色：无效token
+              balanceElement.classList.add('balance-invalid');
+            } else if (data.balance !== null && data.balance <= 0) {
+              // 黄色：余额不足
+              balanceElement.classList.add('balance-low');
+            } else if (data.balance !== null && data.balance > 0) {
+              // 绿色：余额正常
+              balanceElement.classList.add('balance-ok');
+            }
+            
             // 更新本地令牌数据
             const tokenIndex = tokens.findIndex(t => t.id === index);
             if (tokenIndex !== -1) {
               tokens[tokenIndex].balance = data.balance;
+              tokens[tokenIndex].isValid = data.isValid;
               tokens[tokenIndex].lastChecked = new Date().toISOString();
             }
+            
+            return { success: true, balance: data.balance, isValid: data.isValid };
           } else {
             console.error('刷新余额失败:', data.message || '未知错误');
             balanceElement.textContent = '查询失败';
-            setTimeout(() => {
+            balanceElement.classList.remove('balance-ok', 'balance-low');
+            balanceElement.classList.add('balance-invalid');
+            
+            setTimeout(function() {
               balanceElement.textContent = '-';
             }, 2000);
+            return { success: false, error: data.message || '未知错误' };
           }
         } catch (error) {
           console.error('刷新余额失败:', error);
           balanceElement.textContent = '查询失败';
-          setTimeout(() => {
+          balanceElement.classList.remove('balance-ok', 'balance-low');
+          balanceElement.classList.add('balance-invalid');
+          
+          setTimeout(function() {
             balanceElement.textContent = '-';
           }, 2000);
+          return { success: false, error: error.message || '未知错误' };
         } finally {
           refreshBtn.classList.remove('spinning');
         }
-      }
-      
-      // 批量刷新余额
-      async function batchRefreshBalance(tokenKeys) {
-        if (tokenKeys.length === 0) return;
-        
-        const totalTokens = tokenKeys.length;
-        showAlert("正在刷新选中令牌的余额 (0/" + totalTokens + ")...", 'info');
-        
-        let processed = 0;
-        
-        // 找到所有选中的令牌
-        for (const tokenIndex of tokenKeys) {
-          // 将字符串索引转换为数字
-          const index = parseInt(tokenIndex);
-          if (index >= 0 && index < tokens.length) {
-            await refreshTokenBalance(index, index);
-            processed++;
-            
-            // 更新提示
-            if (processed % 3 === 0 || processed === totalTokens) {
-              showAlert("正在刷新选中令牌的余额 (" + processed + "/" + totalTokens + ")...", 'info');
-            }
-          }
-        }
-        
-        showAlert("已刷新 " + processed + "/" + totalTokens + " 个令牌的余额", 'success');
-        
-        // 强制从KV刷新令牌列表，确保所有余额数据都是最新的，抑制默认刷新消息
-        refreshTokenList(true, true);
       }
       
       // 筛选令牌表格
@@ -3105,7 +3821,7 @@ const dashboardHtml = `
         const rows = tokenTableBody.querySelectorAll('tr');
         const searchLower = searchText.toLowerCase();
         
-        rows.forEach(row => {
+        rows.forEach(function(row) {
           const tokenCell = row.querySelector('td:nth-child(3)');
           if (!tokenCell) return;
           
@@ -3152,7 +3868,7 @@ const dashboardHtml = `
         alertElement.classList.add('show');
         
         // 自动消失
-        setTimeout(() => {
+        setTimeout(function() {
           alertElement.classList.remove('show');
         }, 3000);
       }
