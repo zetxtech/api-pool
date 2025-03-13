@@ -27,13 +27,8 @@ const DEFAULT_ADMIN_PASSWORD = "xxx";
 // ==================== 内存数据存储 ====================
 // 存储API令牌列表
 let tokens = [];
-// 改进的数据锁机制
-let dataLock = {
-  locked: false,
-  owner: null,
-  timestamp: 0,
-  timeout: 20000, // 锁超时时间，20秒
-};
+// 锁定状态，防止并发写入
+let dataLock = false;
 // 请求统计数据 - 分钟级
 let requestTimestamps = [];
 let tokenCounts = [];
@@ -55,8 +50,8 @@ let pendingUpdates = 0;
 
 // ==================== 缓存配置 ====================
 const CACHE_TTL = {
-  TOKENS: 30 * 1000, // 令牌缓存半分钟
-  STATS: 30 * 1000, // 统计数据缓存半分钟
+  TOKENS: 5 * 60 * 1000, // 令牌缓存5分钟
+  STATS: 2 * 60 * 1000, // 统计数据缓存2分钟
 };
 
 // 缓存对象
@@ -97,35 +92,16 @@ class Logger {
 }
 
 // ==================== 数据锁定管理 ====================
-function acquireDataLock(operationId = null) {
-  const now = Date.now();
-
-  // 检查是否有锁超时，自动释放
-  if (dataLock.locked && now - dataLock.timestamp > dataLock.timeout) {
-    Logger.warn(`检测到锁超时，自动释放。上一个持有者: ${dataLock.owner || "未知"}, 持有时间: ${(now - dataLock.timestamp) / 1000}秒`);
-    releaseDataLock(true);
+function acquireDataLock() {
+  if (dataLock) {
+    return false;
   }
-
-  // 尝试获取锁
-  if (!dataLock.locked) {
-    dataLock.locked = true;
-    dataLock.owner = operationId || `op-${now}-${Math.random().toString(36).substring(2, 7)}`;
-    dataLock.timestamp = now;
-    return dataLock.owner; // 返回锁ID而不是布尔值
-  }
-
-  return false;
+  dataLock = true;
+  return true;
 }
 
-function releaseDataLock(force = false, lockId = null) {
-  // 只有锁的拥有者或强制释放才能解锁
-  if (force || !lockId || dataLock.owner === lockId) {
-    dataLock.locked = false;
-    dataLock.owner = null;
-    return true;
-  }
-  Logger.warn(`尝试释放非自己持有的锁被拒绝。请求者: ${lockId}, 持有者: ${dataLock.owner}`);
-  return false;
+function releaseDataLock() {
+  dataLock = false;
 }
 
 // ==================== 令牌管理函数 ====================
@@ -290,8 +266,7 @@ function estimateTokenCount(text, isChatMessage = false, textType = "normal") {
 
 // 添加令牌到KV
 async function addTokenToKV(env, tokenInput) {
-  const lockId = acquireDataLock("add-token");
-  if (!lockId) {
+  if (!acquireDataLock()) {
     return { success: false, message: "系统正忙，请稍后再试" };
   }
 
@@ -304,7 +279,7 @@ async function addTokenToKV(env, tokenInput) {
     const validTokens = tokenLines.filter((token) => token.length > 0);
 
     if (validTokens.length === 0) {
-      releaseDataLock(false, lockId);
+      releaseDataLock();
       return { success: false, message: "未提供有效的令牌" };
     }
 
@@ -337,7 +312,7 @@ async function addTokenToKV(env, tokenInput) {
     // 保存更新后的令牌列表
     await saveTokensToKV(env);
 
-    releaseDataLock(false, lockId);
+    releaseDataLock();
 
     let message = `成功添加了${addedCount}个令牌`;
     if (duplicateCount > 0) {
@@ -352,19 +327,15 @@ async function addTokenToKV(env, tokenInput) {
     };
   } catch (error) {
     Logger.error("添加令牌失败:", error);
-    releaseDataLock(false, lockId);
+    releaseDataLock();
     return { success: false, message: "添加令牌失败: " + error.message };
   }
 }
 
 // 从KV删除令牌
 async function removeTokenFromKV(env, tokenToRemove, skipLock = false) {
-  let lockId = null;
-  if (!skipLock) {
-    lockId = acquireDataLock("remove-token");
-    if (!lockId) {
-      return { success: false, message: "系统正忙，请稍后再试" };
-    }
+  if (!skipLock && !acquireDataLock()) {
+    return { success: false, message: "系统正忙，请稍后再试" };
   }
 
   try {
@@ -378,7 +349,7 @@ async function removeTokenFromKV(env, tokenToRemove, skipLock = false) {
     const validTokens = tokenLines.filter((token) => token.length > 0);
 
     if (validTokens.length === 0) {
-      if (!skipLock) releaseDataLock(false, lockId);
+      if (!skipLock) releaseDataLock();
       return { success: false, message: "未提供有效的令牌" };
     }
 
@@ -389,7 +360,7 @@ async function removeTokenFromKV(env, tokenToRemove, skipLock = false) {
     // 保存更新后的令牌列表
     await saveTokensToKV(env);
 
-    if (!skipLock) releaseDataLock(false, lockId);
+    if (!skipLock) releaseDataLock();
 
     return {
       success: true,
@@ -398,15 +369,14 @@ async function removeTokenFromKV(env, tokenToRemove, skipLock = false) {
     };
   } catch (error) {
     Logger.error("删除令牌失败:", error);
-    if (!skipLock) releaseDataLock(false, lockId);
+    if (!skipLock) releaseDataLock();
     return { success: false, message: "删除令牌失败: " + error.message };
   }
 }
 
 // 切换令牌状态
 async function toggleTokenStatus(env, tokenKey) {
-  const lockId = acquireDataLock("toggle-token");
-  if (!lockId) {
+  if (!acquireDataLock()) {
     return { success: false, message: "系统正忙，请稍后再试" };
   }
 
@@ -418,7 +388,7 @@ async function toggleTokenStatus(env, tokenKey) {
     const tokenIndex = tokens.findIndex((t) => t.key === tokenKey);
 
     if (tokenIndex === -1) {
-      releaseDataLock(false, lockId);
+      releaseDataLock();
       return { success: false, message: "未找到指定的令牌" };
     }
 
@@ -426,25 +396,19 @@ async function toggleTokenStatus(env, tokenKey) {
     tokens[tokenIndex].enabled = !tokens[tokenIndex].enabled;
     const newStatus = tokens[tokenIndex].enabled ? "启用" : "禁用";
 
-    // 如果是启用令牌，重置连续错误计数
-    if (tokens[tokenIndex].enabled) {
-      tokens[tokenIndex].consecutiveErrors = 0;
-      Logger.info(`手动启用令牌 ${obfuscateKey(tokenKey)}，已重置连续错误计数`);
-    }
-
     // 保存更新后的令牌列表
     await saveTokensToKV(env);
 
-    releaseDataLock(false, lockId);
+    releaseDataLock();
 
     return {
       success: true,
-      message: `已将令牌状态切换为${newStatus}${tokens[tokenIndex].enabled ? "并重置错误计数" : ""}`,
+      message: `已将令牌状态切换为${newStatus}`,
       enabled: tokens[tokenIndex].enabled,
     };
   } catch (error) {
     Logger.error("切换令牌状态失败:", error);
-    releaseDataLock(false, lockId);
+    releaseDataLock();
     return { success: false, message: "切换令牌状态失败: " + error.message };
   }
 }
@@ -517,42 +481,14 @@ function getSmartToken() {
 
 // 根据请求路径选择令牌
 function selectTokenForRequest(requestPath) {
-  // 过滤出启用状态的令牌
-  const enabledTokens = tokens.filter((token) => token.enabled);
-
-  // 如果没有启用的令牌，直接返回null
-  if (enabledTokens.length === 0) {
-    Logger.warn("没有可用的启用状态令牌");
-    return null;
-  }
-
-  // 根据不同的请求路径选择不同的令牌选择策略
-  let selectedToken = null;
+  // 这里可以根据不同的请求路径选择不同的令牌选择策略
+  // 例如，对于图像生成使用不同的策略
 
   if (requestPath.includes(API_ENDPOINTS.images)) {
-    // 对于图像请求使用简单轮询
-    selectedToken = getNextToken();
+    return getNextToken(); // 对于图像请求使用简单轮询
   } else {
-    // 对于其他请求使用智能选择
-    selectedToken = getSmartToken();
+    return getSmartToken(); // 对于其他请求使用智能选择
   }
-
-  // 如果选择失败，尝试使用另一种策略
-  if (!selectedToken && requestPath.includes(API_ENDPOINTS.images)) {
-    Logger.debug("图像请求轮询选择失败，尝试智能选择");
-    selectedToken = getSmartToken();
-  } else if (!selectedToken) {
-    Logger.debug("智能选择失败，尝试轮询选择");
-    selectedToken = getNextToken();
-  }
-
-  if (selectedToken) {
-    Logger.debug(`已选择令牌: ${obfuscateKey(selectedToken.key)}`);
-  } else {
-    Logger.warn("无法选择可用令牌");
-  }
-
-  return selectedToken;
 }
 
 // ==================== 统计数据管理 ====================
@@ -722,11 +658,7 @@ async function saveStatsToKV(env, forceSave = false) {
 
   try {
     // 获取数据锁，防止并发写入
-    const lockId = await acquireDataLock("save-stats");
-    if (!lockId) {
-      Logger.warn("保存统计数据时无法获取锁，稍后重试");
-      return false;
-    }
+    await acquireDataLock();
 
     const statsData = {
       requestTimestamps,
@@ -751,10 +683,10 @@ async function saveStatsToKV(env, forceSave = false) {
 
     lastStatsSave = now;
     Logger.info("已保存请求统计数据到KV并更新缓存");
-    releaseDataLock(false, lockId);
+    releaseDataLock();
     return true;
   } catch (error) {
-    releaseDataLock(true); // 强制释放锁，防止死锁
+    releaseDataLock();
     Logger.error("保存请求统计数据失败:", error);
     return false;
   }
@@ -784,7 +716,12 @@ async function updateTokenStats(token, success, tokenCount = 0, env = null) {
       tokens[tokenIndex].consecutiveErrors = (tokens[tokenIndex].consecutiveErrors || 0) + 1;
       tokens[tokenIndex].lastErrorTime = new Date().toISOString(); // 记录最后错误时间
 
-      // 注意：令牌禁用逻辑已移至handleApiRequest函数中，确保在达到最大重试次数后才禁用令牌
+      // 如果连续错误超过阈值，禁用令牌
+      const MAX_CONSECUTIVE_ERRORS = 3; // 自定义修改为您的连续错误次数
+      if (tokens[tokenIndex].consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        Logger.warn(`令牌 ${obfuscateKey(token.key)} 连续错误${MAX_CONSECUTIVE_ERRORS}次，自动禁用`);
+        tokens[tokenIndex].enabled = false;
+      }
     }
   }
 
@@ -806,10 +743,24 @@ async function updateTokenStats(token, success, tokenCount = 0, env = null) {
   // 判断是否需要保存到KV
   const shouldSave = env ? true : false; // 只要有环境变量，就立即保存到KV
 
-  // 如果需要保存到KV
+  // 旧逻辑：
+  // const shouldSave =
+  //   env &&
+  //   (pendingUpdates >= MAX_PENDING_UPDATES || // 积累足够多的更新
+  //     now - lastKVSaveTime >= KV_SAVE_INTERVAL || // 超过时间间隔
+  //     !success || // 发生错误时立即保存
+  //     (tokenIndex !== -1 && !tokens[tokenIndex].enabled)); // 令牌被禁用时立即保存
+
   if (shouldSave) {
-    await saveTokensToKV(env);
-    await saveStatsToKV(env, true);
+    try {
+      await saveTokensToKV(env);
+      await saveStatsToKV(env, true); // 强制保存统计数据
+      lastKVSaveTime = now;
+      pendingUpdates = 0;
+      Logger.debug(`实时保存统计数据到KV存储`);
+    } catch (error) {
+      Logger.error("保存统计数据失败:", error);
+    }
   }
 }
 
@@ -1192,6 +1143,22 @@ async function handleApiRequest(req, path, headers, env) {
     );
   }
 
+  // 选择合适的令牌
+  const token = selectTokenForRequest(path);
+
+  if (!token) {
+    return jsonResponse(
+      {
+        error: {
+          message: "无可用的API令牌，请联系管理员",
+          type: "api_error",
+          code: "no_token_available",
+        },
+      },
+      503
+    );
+  }
+
   // 记录开始时间
   const startTime = Date.now();
 
@@ -1214,7 +1181,7 @@ async function handleApiRequest(req, path, headers, env) {
       return jsonResponse(
         {
           error: {
-            message: "无法读取请求体",
+            message: "无法处理请求数据",
             type: "api_error",
             code: "invalid_request",
           },
@@ -1237,500 +1204,318 @@ async function handleApiRequest(req, path, headers, env) {
     return false;
   })();
 
-  // 自定义重试逻辑
-  const MAX_RETRIES = 3; // 最大重试次数
-  const MAX_CONSECUTIVE_ERRORS = 3; // 连续错误达到此值时禁用令牌
-  const RETRY_DELAY_MS = 500; // 重试延迟基础值
+  // 重试逻辑
+  const MAX_RETRIES = 3; // 自定义修改为您的重试次数
+  const RETRY_DELAY_MS = 500;
+  let retryCount = 0;
+  let tokenUsage = 0;
 
-  // 已尝试过的令牌列表，用于避免重复使用同一个令牌
-  const triedTokens = new Set();
+  while (retryCount <= MAX_RETRIES) {
+    try {
+      // 构造请求URL
+      const url = `${API_BASE_URL}${path}`;
 
-  // 当前使用的令牌
-  let currentToken = null;
+      // 创建请求头，添加授权信息
+      const requestHeaders = new Headers(headers);
+      requestHeaders.set("Authorization", `Bearer ${token.key}`);
 
-  // 尝试获取一个可用的令牌
-  currentToken = selectTokenForRequest(path);
-  Logger.info(`初始选择令牌: ${currentToken ? obfuscateKey(currentToken.key) : "无可用令牌"}`);
+      // 准备请求选项
+      const requestOptions = {
+        method: req.method,
+        headers: requestHeaders,
+        redirect: "follow",
+      };
 
-  if (!currentToken) {
-    return jsonResponse(
-      {
-        error: {
-          message: "无可用的API令牌，请联系管理员",
-          type: "api_error",
-          code: "no_token_available",
-        },
-      },
-      503
-    );
-  }
-
-  // 记录当前令牌已尝试
-  triedTokens.add(currentToken.key);
-
-  // 主请求循环 - 尝试所有可用令牌
-  while (true) {
-    let tokenUsage = 0;
-    let retryCount = 0;
-    let shouldSwitchToken = false;
-
-    // 单个令牌的重试循环
-    while (retryCount <= MAX_RETRIES && !shouldSwitchToken) {
-      try {
-        Logger.info(`使用令牌 ${obfuscateKey(currentToken.key)} 发送请求 (尝试 ${retryCount + 1}/${MAX_RETRIES + 1})`);
-
-        // 构造请求URL
-        const url = `${API_BASE_URL}${path}`;
-
-        // 创建请求头，添加授权信息
-        const requestHeaders = new Headers(headers);
-        requestHeaders.set("Authorization", `Bearer ${currentToken.key}`);
-
-        // 准备请求选项
-        const requestOptions = {
-          method: req.method,
-          headers: requestHeaders,
-          redirect: "follow",
-        };
-
-        // 根据请求类型添加请求体
-        if (req.method !== "GET") {
-          if (isMultipart) {
-            // 对于multipart/form-data，直接传递原始请求体
-            requestOptions.body = requestBody;
-          } else {
-            // 对于其他请求类型，使用文本请求体
-            requestOptions.body = requestBody;
-          }
-        }
-
-        // 发送请求
-        const response = await fetch(url, requestOptions);
-
-        // 检查响应状态码，如果不是成功状态码，则抛出错误触发重试
-        if (!response.ok) {
-          // 读取响应文本以便记录错误信息
-          const errorText = await response.text();
-          let errorMessage = `API返回错误状态码: ${response.status}`;
-
-          try {
-            // 尝试解析错误响应为JSON
-            const errorJson = JSON.parse(errorText);
-            if (errorJson.error && errorJson.error.message) {
-              errorMessage = `API错误: ${errorJson.error.message}`;
-            }
-          } catch (e) {
-            // 如果无法解析为JSON，使用原始错误文本
-            if (errorText && errorText.length < 100) {
-              errorMessage += ` - ${errorText}`;
-            }
-          }
-
-          // 记录错误信息
-          Logger.error(`请求失败: 状态码=${response.status}, 令牌=${obfuscateKey(currentToken.key)}, 错误=${errorMessage}`);
-
-          // 抛出错误以触发重试逻辑
-          throw new Error(errorMessage);
-        }
-
-        // 如果是流式请求，处理流式响应
-        if (isStreamRequest && response.ok) {
-          Logger.info(`开始处理流式响应: 路径=${path}, 状态=${response.status}, 令牌=${obfuscateKey(currentToken.key)}`);
-
-          // 自定义延迟算法的配置
-          const streamConfig = {
-            minDelay: 2, // 最小延迟(毫秒)，降低以提高响应速度
-            maxDelay: 20, // 最大延迟(毫秒)，减小以提高整体流畅性
-            adaptiveDelayFactor: 0.35, // 自适应延迟因子，降低以使输出更平滑
-            chunkBufferSize: 20, // 增大计算平均响应大小的缓冲区
-            minContentLengthForFastOutput: 300, // 降低启用快速输出的阈值
-            fastOutputDelay: 1, // 快速输出时的固定延迟，降低以加快输出
-            finalLowDelay: 0.5, // 模型完成响应后的低延迟
-            interMessageDelay: 3, // 消息之间的延迟时间，降低以减少停顿感
-            fastModeThreshold: 2000, // 大内容自动启用快速模式的阈值
-            intelligentBatching: true, // 启用智能批处理
-            maxBatchSize: 6, // 最大批处理大小，增加以减少请求次数
-            collectCompletionText: true, // 启用响应内容收集以准确计算token
-            // 添加更新统计信息的回调函数
-            updateStatsCallback: async (completionTokens) => {
-              try {
-                // 初始token估算（提示部分）
-                const promptTokens = await estimateTokenUsageFromRequest(requestBody, path);
-
-                // 计算总token使用量
-                const totalTokens = promptTokens + completionTokens;
-
-                Logger.info(`流式响应完成: 路径=${path}, 令牌=${obfuscateKey(currentToken.key)}, ` + `总Token=${totalTokens} (提示: ${promptTokens}, 完成: ${completionTokens})`);
-
-                // 更新token统计信息
-                await updateTokenStats(currentToken, true, totalTokens, env);
-              } catch (e) {
-                Logger.warn(`更新流式响应token统计失败: ${e.message}`);
-              }
-            },
-          };
-
-          // 创建转换流
-          const { readable, writable } = new TransformStream();
-
-          // 初始token估算（仅用于临时记录）
-          const initialTokenUsage = await estimateTokenUsageFromRequest(requestBody, path);
-          Logger.debug(`流式请求初始token估算: ${initialTokenUsage}`);
-
-          // 处理流式响应 - 不在此处立即更新统计信息，而是在流结束后由回调更新
-          processStreamingResponse(response.body, writable, streamConfig);
-
-          // 返回流式响应
-          return new Response(readable, {
-            status: response.status,
-            headers: {
-              "Content-Type": "text/event-stream",
-              "Cache-Control": "no-cache",
-              Connection: "keep-alive",
-            },
-          });
-        }
-
-        // 非流式响应处理 - 保持现有代码
-        // 读取响应数据
-        const responseText = await response.text();
-        let responseData;
-
-        try {
-          responseData = JSON.parse(responseText);
-
-          // 提取token使用量
-          if (responseData.usage) {
-            // 处理不同API返回的token使用量格式
-            if (responseData.usage.total_tokens) {
-              // 某些API直接返回total_tokens
-              tokenUsage = responseData.usage.total_tokens;
-            } else if (responseData.usage.prompt_tokens !== undefined && responseData.usage.completion_tokens !== undefined) {
-              // 大多数API返回prompt_tokens和completion_tokens
-              const promptTokens = responseData.usage.prompt_tokens || 0;
-              const completionTokens = responseData.usage.completion_tokens || 0;
-              tokenUsage = promptTokens + completionTokens;
-              Logger.debug(`请求使用了${tokenUsage}个token (prompt: ${promptTokens}, completion: ${completionTokens})`);
-            } else if (responseData.usage.prompt_tokens !== undefined) {
-              // 仅返回prompt_tokens的API (如embeddings)
-              tokenUsage = responseData.usage.prompt_tokens || 0;
-              Logger.debug(`请求使用了${tokenUsage}个prompt token`);
-            }
-          } else if (path.includes(API_ENDPOINTS.images)) {
-            // 图像生成请求的token估算 - 根据请求参数动态计算
-            try {
-              const requestJson = JSON.parse(requestBody);
-
-              // 基础token消耗
-              let baseTokens = 1000;
-
-              // 根据提示词长度添加token
-              if (requestJson.prompt) {
-                baseTokens += estimateTokenCount(requestJson.prompt, false, "image_prompt");
-              }
-
-              // 根据图片数量调整
-              const n = requestJson.n || 1;
-
-              // 根据尺寸调整
-              let sizeMultiplier = 1.0;
-              if (requestJson.size) {
-                // 常见尺寸的倍数
-                const sizeMappings = {
-                  "256x256": 0.6,
-                  "512x512": 1.0,
-                  "1024x1024": 2.0,
-                  "1792x1024": 2.5,
-                  "1024x1792": 2.5,
-                };
-                sizeMultiplier = sizeMappings[requestJson.size] || 1.0;
-              }
-
-              // 根据质量调整
-              let qualityMultiplier = 1.0;
-              if (requestJson.quality === "hd") {
-                qualityMultiplier = 1.5;
-              }
-
-              // 计算最终的token使用量
-              tokenUsage = Math.round(baseTokens * n * sizeMultiplier * qualityMultiplier);
-
-              Logger.debug(`图像生成请求，动态估算使用了${tokenUsage}个token（图片数量：${n}，尺寸倍数：${sizeMultiplier}，质量倍数：${qualityMultiplier}）`);
-            } catch (e) {
-              // 如果解析失败，回退到默认值
-              tokenUsage = 4500;
-              Logger.debug(`图像生成请求，无法解析参数，使用默认估算${tokenUsage}个token`);
-            }
-          } else if (path.includes(API_ENDPOINTS.audio)) {
-            // 音频转录请求的token估算 - 基于实际响应内容
-            if (responseData && responseData.text) {
-              // 使用转录文本长度计算token数
-              const transcriptionText = responseData.text;
-              // 使用辅助函数估算token
-              const estimatedTokens = estimateTokenCount(transcriptionText);
-
-              // 加上基础处理开销
-              tokenUsage = Math.max(500, estimatedTokens + 500);
-              Logger.debug(`音频转录请求，基于转录内容估算使用了${tokenUsage}个token（文本长度：${transcriptionText.length}）`);
-            } else {
-              // 无法获取转录文本时，使用一个较为保守的估算
-              tokenUsage = 1500;
-              Logger.debug(`音频转录请求，无法获取转录文本，使用保守估算${tokenUsage}个token`);
-            }
-          } else if (path.includes(API_ENDPOINTS.rerank)) {
-            // 重排序请求的token估算
-            try {
-              const requestJson = JSON.parse(requestBody);
-              let totalTokens = 0;
-
-              // 计算查询的token
-              if (requestJson.query) {
-                const queryTokens = estimateTokenCount(requestJson.query);
-                totalTokens += queryTokens;
-                Logger.debug(`重排序查询token：${queryTokens}`);
-              }
-
-              // 计算文档的token
-              if (requestJson.documents && Array.isArray(requestJson.documents)) {
-                let docsTokens = 0;
-                requestJson.documents.forEach((doc) => {
-                  docsTokens += estimateTokenCount(String(doc));
-                });
-                totalTokens += docsTokens;
-                Logger.debug(`重排序文档token：${docsTokens}（文档数量：${requestJson.documents.length}）`);
-              }
-
-              // 加上基础处理开销
-              tokenUsage = Math.max(100, totalTokens);
-              Logger.debug(`重排序请求估算token：${tokenUsage}`);
-            } catch (e) {
-              // 解析失败时的默认估算
-              tokenUsage = 500;
-              Logger.debug(`重排序请求解析失败，使用默认估算${tokenUsage}个token`);
-            }
-          } else {
-            // 优化的通用token估算方法
-            try {
-              // 尝试解析请求体为JSON
-              let requestJson;
-              try {
-                requestJson = JSON.parse(requestBody);
-              } catch (e) {
-                // 非JSON请求体，使用字符长度估算
-                const requestBodyLength = requestBody ? requestBody.length : 0;
-                tokenUsage = Math.max(10, Math.ceil(requestBodyLength / 3));
-                Logger.debug(`请求使用了非JSON格式，基于长度估算token：${tokenUsage}`);
-                throw new Error("Not JSON"); // 跳到catch块
-              }
-
-              // 处理不同类型的JSON请求
-              if (requestJson.messages && Array.isArray(requestJson.messages)) {
-                // 聊天请求的估算
-                tokenUsage = 0;
-
-                // 计算所有消息的token
-                requestJson.messages.forEach((msg) => {
-                  if (msg.content) {
-                    tokenUsage += estimateTokenCount(String(msg.content), true);
-                  }
-                });
-
-                Logger.debug(`聊天请求估算token：${tokenUsage}`);
-              } else if (requestJson.input || requestJson.prompt) {
-                // 处理单一输入请求（如completions或embeddings）
-                const input = String(requestJson.input || requestJson.prompt || "");
-                tokenUsage = estimateTokenCount(input);
-                Logger.debug(`单一输入请求估算token：${tokenUsage}（总字符：${input.length}）`);
-              } else {
-                // 其他JSON请求
-                const jsonLength = JSON.stringify(requestJson).length;
-                tokenUsage = Math.max(10, Math.ceil(jsonLength / 4));
-                Logger.debug(`其他JSON请求估算token：${tokenUsage}（JSON长度：${jsonLength}）`);
-              }
-            } catch (e) {
-              // 如果上面的处理出错，回退到简单估算
-              if (e.message !== "Not JSON") {
-                Logger.warn(`Token估算出错: ${e.message}，使用简单估算`);
-                const requestBodyLength = requestBody ? requestBody.length : 0;
-                tokenUsage = Math.max(10, Math.ceil(requestBodyLength / 3));
-              }
-            }
-
-            Logger.debug(`无法从响应中获取token使用量，估算使用了${tokenUsage}个token`);
-          }
-
-          // 记录详细日志，
-          const endTime = Date.now();
-          const totalTime = (endTime - startTime) / 1000; // 转换为秒
-          Logger.info(
-            `请求完成: 路径=${path}, ` + `状态=${response.status}, ` + `令牌=${obfuscateKey(currentToken.key)}, ` + `用时=${totalTime.toFixed(2)}秒, ` + `Token=${tokenUsage}`
-          );
-        } catch (e) {
-          Logger.warn(`解析响应数据失败: ${e.message}`);
-          responseData = responseText;
-          // 默认token估算
-          tokenUsage = 10; // 设置一个默认值
-        }
-
-        // 更新统计
-        const success = response.status >= 200 && response.status < 300;
-        await updateTokenStats(currentToken, success, tokenUsage, env);
-
-        // 创建响应
-        const responseHeaders = new Headers();
-        responseHeaders.set("Content-Type", response.headers.get("Content-Type") || "application/json");
-
-        return new Response(responseText, {
-          status: response.status,
-          headers: responseHeaders,
-        });
-      } catch (error) {
-        // 请求失败，记录错误并更新令牌统计
-        // 更新当前令牌的失败统计
-        await updateTokenStats(currentToken, false, 0, env);
-
-        // 获取当前令牌的最新状态和连续错误次数
-        const tokenIndex = tokens.findIndex((t) => t.key === currentToken.key);
-        const consecutiveErrors = tokenIndex !== -1 ? tokens[tokenIndex].consecutiveErrors || 0 : 0;
-
-        // 增加重试计数
-        retryCount++;
-
-        // 更直观地显示连续错误次数和重试进度
-        Logger.error(
-          `API请求失败 [${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}连续错误] [${retryCount}/${MAX_RETRIES + 1}重试]: 令牌=${obfuscateKey(currentToken.key)}, 错误=${
-            error.message
-          }`
-        );
-
-        // 检查是否需要禁用令牌并切换到新令牌
-        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-          // 连续错误达到阈值，禁用令牌
-          if (tokenIndex !== -1) {
-            tokens[tokenIndex].enabled = false;
-            // 禁用令牌后将连续错误计数归零
-            tokens[tokenIndex].consecutiveErrors = 0;
-            Logger.warn(`令牌 ${obfuscateKey(currentToken.key)} 连续错误达到上限(${MAX_CONSECUTIVE_ERRORS}/${MAX_CONSECUTIVE_ERRORS})，自动禁用并重置错误计数`);
-
-            // 保存令牌状态到KV
-            if (env) {
-              await saveTokensToKV(env);
-            }
-          }
-
-          // 标记需要切换令牌
-          shouldSwitchToken = true;
-          Logger.info(`令牌 ${obfuscateKey(currentToken.key)} 已被禁用，将切换到新令牌`);
-        } else if (retryCount > MAX_RETRIES) {
-          // 达到最大重试次数，但连续错误未达到阈值，仍然禁用令牌
-          if (tokenIndex !== -1) {
-            tokens[tokenIndex].enabled = false;
-            // 禁用令牌后将连续错误计数归零
-            tokens[tokenIndex].consecutiveErrors = 0;
-            Logger.warn(`令牌 ${obfuscateKey(currentToken.key)} 达到最大重试次数(${MAX_RETRIES}/${MAX_RETRIES})，自动禁用并重置错误计数`);
-
-            // 保存令牌状态到KV
-            if (env) {
-              await saveTokensToKV(env);
-            }
-          }
-
-          // 标记需要切换令牌
-          shouldSwitchToken = true;
-          Logger.info(`令牌 ${obfuscateKey(currentToken.key)} 已达到最大重试次数，将切换到新令牌`);
+      // 根据请求类型添加请求体
+      if (req.method !== "GET") {
+        if (isMultipart) {
+          // 对于multipart/form-data，直接传递原始请求体
+          requestOptions.body = requestBody;
         } else {
-          // 未达到最大重试次数，继续使用当前令牌重试
-          Logger.info(`使用令牌 ${obfuscateKey(currentToken.key)} 重试请求 [${retryCount}/${MAX_RETRIES}] [连续错误:${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}]`);
-
-          // 等待一段时间后重试，随着重试次数增加延迟也增加
-          const delay = RETRY_DELAY_MS * retryCount;
-          Logger.debug(`等待 ${delay}ms 后重试`);
-          await new Promise((resolve) => setTimeout(resolve, delay));
+          // 对于其他请求类型，使用文本请求体
+          requestOptions.body = requestBody;
         }
       }
-    }
 
-    // 如果需要切换令牌
-    if (shouldSwitchToken) {
-      // 获取新令牌，排除已尝试过的令牌
-      const newToken = getNewToken(path, triedTokens);
+      // 发送请求
+      const response = await fetch(url, requestOptions);
 
-      if (!newToken) {
-        // 所有令牌都已尝试，返回错误
-        Logger.error(`所有可用令牌已尝试，请求失败`);
+      // 如果是流式请求，处理流式响应
+      if (isStreamRequest && response.ok) {
+        Logger.info(`开始处理流式响应: 路径=${path}, 状态=${response.status}, 令牌=${obfuscateKey(token.key)}`);
+
+        // 自定义延迟算法的配置
+        const streamConfig = {
+          minDelay: 3, // 最小延迟(毫秒)，降低以提高响应速度
+          maxDelay: 30, // 最大延迟(毫秒)，减小以提高整体流畅性
+          adaptiveDelayFactor: 0.5, // 自适应延迟因子
+          chunkBufferSize: 15, // 增大计算平均响应大小的缓冲区
+          minContentLengthForFastOutput: 500, // 降低启用快速输出的阈值
+          fastOutputDelay: 2, // 快速输出时的固定延迟，降低以加快输出
+          finalLowDelay: 1, // 模型完成响应后的低延迟
+          interMessageDelay: 5, // 消息之间的延迟时间
+          fastModeThreshold: 3000, // 大内容自动启用快速模式的阈值
+          intelligentBatching: true, // 启用智能批处理
+          maxBatchSize: 5, // 最大批处理大小
+          collectCompletionText: true, // 启用响应内容收集以准确计算token
+          // 添加更新统计信息的回调函数
+          updateStatsCallback: async (completionTokens) => {
+            try {
+              // 初始token估算（提示部分）
+              const promptTokens = await estimateTokenUsageFromRequest(requestBody, path);
+
+              // 计算总token使用量
+              const totalTokens = promptTokens + completionTokens;
+
+              Logger.info(`流式响应完成: 路径=${path}, 令牌=${obfuscateKey(token.key)}, ` + `总Token=${totalTokens} (提示: ${promptTokens}, 完成: ${completionTokens})`);
+
+              // 更新token统计信息
+              await updateTokenStats(token, true, totalTokens, env);
+            } catch (e) {
+              Logger.warn(`更新流式响应token统计失败: ${e.message}`);
+            }
+          },
+        };
+
+        // 创建转换流
+        const { readable, writable } = new TransformStream();
+
+        // 初始token估算（仅用于临时记录）
+        const initialTokenUsage = await estimateTokenUsageFromRequest(requestBody, path);
+        Logger.debug(`流式请求初始token估算: ${initialTokenUsage}`);
+
+        // 处理流式响应 - 不在此处立即更新统计信息，而是在流结束后由回调更新
+        processStreamingResponse(response.body, writable, streamConfig);
+
+        // 返回流式响应
+        return new Response(readable, {
+          status: response.status,
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          },
+        });
+      }
+
+      // 非流式响应处理 - 保持现有代码
+      // 读取响应数据
+      const responseText = await response.text();
+      let responseData;
+
+      try {
+        responseData = JSON.parse(responseText);
+
+        // 提取token使用量
+        if (responseData.usage) {
+          // 处理不同API返回的token使用量格式
+          if (responseData.usage.total_tokens) {
+            // 某些API直接返回total_tokens
+            tokenUsage = responseData.usage.total_tokens;
+          } else if (responseData.usage.prompt_tokens !== undefined && responseData.usage.completion_tokens !== undefined) {
+            // 大多数API返回prompt_tokens和completion_tokens
+            const promptTokens = responseData.usage.prompt_tokens || 0;
+            const completionTokens = responseData.usage.completion_tokens || 0;
+            tokenUsage = promptTokens + completionTokens;
+            Logger.debug(`请求使用了${tokenUsage}个token (prompt: ${promptTokens}, completion: ${completionTokens})`);
+          } else if (responseData.usage.prompt_tokens !== undefined) {
+            // 仅返回prompt_tokens的API (如embeddings)
+            tokenUsage = responseData.usage.prompt_tokens || 0;
+            Logger.debug(`请求使用了${tokenUsage}个prompt token`);
+          }
+        } else if (path.includes(API_ENDPOINTS.images)) {
+          // 图像生成请求的token估算 - 根据请求参数动态计算
+          try {
+            const requestJson = JSON.parse(requestBody);
+
+            // 基础token消耗
+            let baseTokens = 1000;
+
+            // 根据提示词长度添加token
+            if (requestJson.prompt) {
+              baseTokens += estimateTokenCount(requestJson.prompt, false, "image_prompt");
+            }
+
+            // 根据图片数量调整
+            const n = requestJson.n || 1;
+
+            // 根据尺寸调整
+            let sizeMultiplier = 1.0;
+            if (requestJson.size) {
+              // 常见尺寸的倍数
+              const sizeMappings = {
+                "256x256": 0.6,
+                "512x512": 1.0,
+                "1024x1024": 2.0,
+                "1792x1024": 2.5,
+                "1024x1792": 2.5,
+              };
+              sizeMultiplier = sizeMappings[requestJson.size] || 1.0;
+            }
+
+            // 根据质量调整
+            let qualityMultiplier = 1.0;
+            if (requestJson.quality === "hd") {
+              qualityMultiplier = 1.5;
+            }
+
+            // 计算最终的token使用量
+            tokenUsage = Math.round(baseTokens * n * sizeMultiplier * qualityMultiplier);
+
+            Logger.debug(`图像生成请求，动态估算使用了${tokenUsage}个token（图片数量：${n}，尺寸倍数：${sizeMultiplier}，质量倍数：${qualityMultiplier}）`);
+          } catch (e) {
+            // 如果解析失败，回退到默认值
+            tokenUsage = 4500;
+            Logger.debug(`图像生成请求，无法解析参数，使用默认估算${tokenUsage}个token`);
+          }
+        } else if (path.includes(API_ENDPOINTS.audio)) {
+          // 音频转录请求的token估算 - 基于实际响应内容
+          if (responseData && responseData.text) {
+            // 使用转录文本长度计算token数
+            const transcriptionText = responseData.text;
+            // 使用辅助函数估算token
+            const estimatedTokens = estimateTokenCount(transcriptionText);
+
+            // 加上基础处理开销
+            tokenUsage = Math.max(500, estimatedTokens + 500);
+            Logger.debug(`音频转录请求，基于转录内容估算使用了${tokenUsage}个token（文本长度：${transcriptionText.length}）`);
+          } else {
+            // 无法获取转录文本时，使用一个较为保守的估算
+            tokenUsage = 1500;
+            Logger.debug(`音频转录请求，无法获取转录文本，使用保守估算${tokenUsage}个token`);
+          }
+        } else if (path.includes(API_ENDPOINTS.rerank)) {
+          // 重排序请求的token估算
+          try {
+            const requestJson = JSON.parse(requestBody);
+            let totalTokens = 0;
+
+            // 计算查询的token
+            if (requestJson.query) {
+              const queryTokens = estimateTokenCount(requestJson.query);
+              totalTokens += queryTokens;
+              Logger.debug(`重排序查询token：${queryTokens}`);
+            }
+
+            // 计算文档的token
+            if (requestJson.documents && Array.isArray(requestJson.documents)) {
+              let docsTokens = 0;
+              requestJson.documents.forEach((doc) => {
+                docsTokens += estimateTokenCount(String(doc));
+              });
+              totalTokens += docsTokens;
+              Logger.debug(`重排序文档token：${docsTokens}（文档数量：${requestJson.documents.length}）`);
+            }
+
+            // 加上基础处理开销
+            tokenUsage = Math.max(100, totalTokens);
+            Logger.debug(`重排序请求估算token：${tokenUsage}`);
+          } catch (e) {
+            // 解析失败时的默认估算
+            tokenUsage = 500;
+            Logger.debug(`重排序请求解析失败，使用默认估算${tokenUsage}个token`);
+          }
+        } else {
+          // 优化的通用token估算方法
+          try {
+            // 尝试解析请求体为JSON
+            let requestJson;
+            try {
+              requestJson = JSON.parse(requestBody);
+            } catch (e) {
+              // 非JSON请求体，使用字符长度估算
+              const requestBodyLength = requestBody ? requestBody.length : 0;
+              tokenUsage = Math.max(10, Math.ceil(requestBodyLength / 3));
+              Logger.debug(`请求使用了非JSON格式，基于长度估算token：${tokenUsage}`);
+              throw new Error("Not JSON"); // 跳到catch块
+            }
+
+            // 处理不同类型的JSON请求
+            if (requestJson.messages && Array.isArray(requestJson.messages)) {
+              // 聊天请求的估算
+              tokenUsage = 0;
+
+              // 计算所有消息的token
+              requestJson.messages.forEach((msg) => {
+                if (msg.content) {
+                  tokenUsage += estimateTokenCount(String(msg.content), true);
+                }
+              });
+
+              Logger.debug(`聊天请求估算token：${tokenUsage}`);
+            } else if (requestJson.input || requestJson.prompt) {
+              // 处理单一输入请求（如completions或embeddings）
+              const input = String(requestJson.input || requestJson.prompt || "");
+              tokenUsage = estimateTokenCount(input);
+              Logger.debug(`单一输入请求估算token：${tokenUsage}（总字符：${input.length}）`);
+            } else {
+              // 其他JSON请求
+              const jsonLength = JSON.stringify(requestJson).length;
+              tokenUsage = Math.max(10, Math.ceil(jsonLength / 4));
+              Logger.debug(`其他JSON请求估算token：${tokenUsage}（JSON长度：${jsonLength}）`);
+            }
+          } catch (e) {
+            // 如果上面的处理出错，回退到简单估算
+            if (e.message !== "Not JSON") {
+              Logger.warn(`Token估算出错: ${e.message}，使用简单估算`);
+              const requestBodyLength = requestBody ? requestBody.length : 0;
+              tokenUsage = Math.max(10, Math.ceil(requestBodyLength / 3));
+            }
+          }
+
+          Logger.debug(`无法从响应中获取token使用量，估算使用了${tokenUsage}个token`);
+        }
+
+        // 记录详细日志，
+        const endTime = Date.now();
+        const totalTime = (endTime - startTime) / 1000; // 转换为秒
+        Logger.info(`请求完成: 路径=${path}, ` + `状态=${response.status}, ` + `令牌=${obfuscateKey(token.key)}, ` + `用时=${totalTime.toFixed(2)}秒, ` + `Token=${tokenUsage}`);
+      } catch (e) {
+        Logger.warn(`解析响应数据失败: ${e.message}`);
+        responseData = responseText;
+        // 默认token估算
+        tokenUsage = 10; // 设置一个默认值
+      }
+
+      // 更新统计
+      const success = response.status >= 200 && response.status < 300;
+      await updateTokenStats(token, success, tokenUsage, env);
+
+      // 创建响应
+      const responseHeaders = new Headers();
+      responseHeaders.set("Content-Type", response.headers.get("Content-Type") || "application/json");
+
+      return new Response(responseText, {
+        status: response.status,
+        headers: responseHeaders,
+      });
+    } catch (error) {
+      Logger.error(`API请求失败 (${retryCount + 1}/${MAX_RETRIES + 1}): ${error}`);
+
+      retryCount++;
+
+      // 最后一次重试也失败了
+      if (retryCount > MAX_RETRIES) {
+        // 更新统计信息
+        await updateTokenStats(token, false, 0, env);
 
         return jsonResponse(
           {
             error: {
-              message: "API请求失败，所有可用令牌均已尝试",
+              message: "API请求失败，已尝试重试",
               type: "api_error",
-              code: "all_tokens_failed",
-              details: "所有可用令牌均已尝试但请求仍然失败",
+              code: "upstream_error",
+              details: error.message,
             },
           },
           502
         );
       }
 
-      // 使用新令牌，记录到已尝试集合
-      Logger.info(`切换到新令牌 ${obfuscateKey(newToken.key)} 继续请求`);
-      currentToken = newToken;
-      triedTokens.add(currentToken.key);
+      // 等待一段时间后重试
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * retryCount));
     }
   }
-}
-
-// 获取新令牌，排除已尝试过的令牌
-function getNewToken(path, triedTokens) {
-  // 过滤出启用状态且未尝试过的令牌
-  const availableTokens = tokens.filter((token) => token.enabled && !triedTokens.has(token.key));
-
-  if (availableTokens.length === 0) {
-    Logger.warn("没有更多可用的令牌");
-    return null;
-  }
-
-  // 根据请求路径选择不同的令牌选择策略
-  let selectedToken = null;
-
-  if (path.includes(API_ENDPOINTS.images)) {
-    // 对于图像请求，按最近最少使用排序
-    availableTokens.sort((a, b) => {
-      if (!a.lastUsed) return -1;
-      if (!b.lastUsed) return 1;
-      return new Date(a.lastUsed) - new Date(b.lastUsed);
-    });
-    selectedToken = availableTokens[0];
-  } else {
-    // 对于其他请求，计算分数并排序
-    availableTokens.forEach((token) => {
-      const totalReq = token.usageCount || 0;
-      const errorRate = totalReq > 0 ? (token.errorCount || 0) / totalReq : 0;
-      const successRate = 1 - errorRate;
-
-      // 找出使用量最大的令牌作为基准
-      const maxUsage = Math.max(...availableTokens.map((t) => t.usageCount || 0));
-      const relativeUsage = maxUsage > 0 ? (token.usageCount || 0) / maxUsage : 0;
-
-      // 计算总分
-      token.score = successRate * 0.7 + (1 - relativeUsage) * 0.3;
-
-      // 连续错误降低分数
-      if (token.consecutiveErrors > 0) {
-        token.score = token.score * Math.pow(0.8, token.consecutiveErrors);
-      }
-    });
-
-    // 按分数降序排序
-    availableTokens.sort((a, b) => b.score - a.score);
-    selectedToken = availableTokens[0];
-  }
-
-  if (selectedToken) {
-    Logger.debug(`已选择新令牌: ${obfuscateKey(selectedToken.key)}`);
-  }
-
-  return selectedToken;
 }
 
 // 根据请求估算Token使用量，用于流式请求的初始统计
@@ -2054,26 +1839,26 @@ function adaptDelay(chunkSize, timeSinceLastChunk, config, isStreamEnding) {
   }
 
   // 确保配置值有效
-  const minDelay = Math.max(1, config.minDelay || 3); // 降低最小延迟
-  const maxDelay = Math.max(minDelay, config.maxDelay || 25); // 降低最大延迟
-  const adaptiveDelayFactor = Math.max(0, Math.min(2, config.adaptiveDelayFactor || 0.4)); // 降低适应因子
+  const minDelay = Math.max(1, config.minDelay || 5);
+  const maxDelay = Math.max(minDelay, config.maxDelay || 40);
+  const adaptiveDelayFactor = Math.max(0, Math.min(2, config.adaptiveDelayFactor || 0.5));
 
   // 改进的延迟计算
 
   // 1. 基于块大小的因子（块越大，延迟越小）
-  // 使用对数缩放提供更平滑的过渡，调整系数使大块内容更快输出
+  // 使用对数缩放提供更平滑的过渡
   const logChunkSize = Math.log2(Math.max(1, chunkSize));
-  const sizeScaleFactor = Math.max(0.15, Math.min(1.2, 3.5 / logChunkSize));
+  const sizeScaleFactor = Math.max(0.2, Math.min(1.5, 4 / logChunkSize));
 
   // 2. 基于时间间隔的因子（时间间隔越长，延迟越大）
-  // 使用更平滑的曲线，减少时间间隔对延迟的影响
-  const timeScaleFactor = Math.sqrt(Math.min(1500, Math.max(50, timeSinceLastChunk)) / 250);
+  // 如果LLM响应慢，我们也应该放慢输出速度使其更自然
+  const timeScaleFactor = Math.sqrt(Math.min(2000, Math.max(50, timeSinceLastChunk)) / 200);
 
-  // 3. 计算最终延迟 - 使用更平滑的曲线
+  // 3. 计算最终延迟
   let delay = minDelay + (maxDelay - minDelay) * sizeScaleFactor * timeScaleFactor * adaptiveDelayFactor;
 
-  // 添加更细微的随机变化（±5%）以使输出更自然但更一致
-  const randomFactor = 0.95 + Math.random() * 0.1;
+  // 添加轻微随机变化（±10%）以使输出更自然
+  const randomFactor = 0.9 + Math.random() * 0.2;
   delay *= randomFactor;
 
   // 确保在允许范围内
@@ -2085,91 +1870,34 @@ async function sendContentCharByChar(content, originalJson, writer, encoder, del
   if (!content) return;
 
   // 检查是否需要快速输出模式
-  const useQuickMode = content.length > (config.minContentLengthForFastOutput || 500); // 降低快速输出的阈值
-  const actualDelay = useQuickMode ? config.fastOutputDelay || 1 : delay; // 降低快速模式的延迟
+  const useQuickMode = content.length > (config.minContentLengthForFastOutput || 1000);
+  const actualDelay = useQuickMode ? config.fastOutputDelay || 2 : delay;
 
   try {
-    // 对于长内容优化批处理大小 - 使用更智能的批处理大小计算
-    let sendBatchSize;
+    // 对于长内容优化批处理大小
+    const sendBatchSize = useQuickMode
+      ? isStreamEnding
+        ? 5
+        : 3 // 流结束时可以发送更大的批次
+      : 1;
 
-    // 根据内容长度动态调整批处理大小，使输出更平滑
-    if (content.length > 200) {
-      // 长内容使用更大的批次，但确保不会太大导致卡顿感
-      sendBatchSize = isStreamEnding ? 6 : 4;
-    } else if (content.length > 50) {
-      // 中等长度内容
-      sendBatchSize = isStreamEnding ? 3 : 2;
-    } else {
-      // 短内容
-      sendBatchSize = 1;
-    }
-
-    // 检测内容是否包含自然语言断点（如标点符号）
-    const punctuationMarks = [".", "。", "!", "！", "?", "？", ",", "，", ";", "；", ":", "：", "\n"];
-
-    // 跟踪上次发送的时间，用于动态调整延迟
-    let lastSendTime = Date.now();
-
-    for (let i = 0; i < content.length; ) {
-      // 寻找最近的自然断点
-      let endIndex = i + sendBatchSize;
-      let foundNaturalBreak = false;
-
-      // 如果不是在结尾，尝试寻找自然断点
-      if (endIndex < content.length - 1) {
-        // 在当前批次范围内查找断点
-        for (let j = i + 1; j <= Math.min(i + sendBatchSize * 1.5, content.length); j++) {
-          if (punctuationMarks.includes(content[j])) {
-            endIndex = j + 1; // 包含标点符号
-            foundNaturalBreak = true;
-            break;
-          }
-        }
-      } else {
-        // 确保不超过内容长度
-        endIndex = Math.min(endIndex, content.length);
-      }
-
+    for (let i = 0; i < content.length; i += sendBatchSize) {
+      const endIndex = Math.min(i + sendBatchSize, content.length);
       const currentBatch = content.substring(i, endIndex);
 
-      // 将原始JSON中的内容替换为当前批次
+      // 将原始JSON中的内容替换为当前字符
       const modifiedJson = JSON.parse(JSON.stringify(originalJson));
       modifiedJson.choices[0].delta.content = currentBatch;
 
-      // 写入当前批次的SSE行
+      // 写入当前字符的SSE行
       const modifiedLine = `data: ${JSON.stringify(modifiedJson)}\n\n`;
       await writer.write(encoder.encode(modifiedLine));
 
-      // 动态调整延迟 - 考虑批次大小和是否在自然断点
-      let dynamicDelay = actualDelay;
-
-      // 在自然断点处增加轻微延迟，使输出更自然
-      if (foundNaturalBreak) {
-        dynamicDelay = Math.min(actualDelay * 1.2, actualDelay + 2);
-      } else if (currentBatch.length <= 1) {
-        // 单字符减少延迟
-        dynamicDelay = Math.max(1, actualDelay * 0.7);
-      }
-
-      // 流结束时使用更短的延迟
-      if (isStreamEnding && content.length - i < 15) {
-        dynamicDelay = Math.min(dynamicDelay, config.finalLowDelay || 1);
-      }
-
-      // 更新索引到下一个位置
-      i = endIndex;
-
-      // 只在批次之间添加延迟，最后一批不添加
-      if (i < content.length) {
-        // 计算实际经过的时间，避免延迟累积
-        const currentTime = Date.now();
-        const elapsedTime = currentTime - lastSendTime;
-        const adjustedDelay = Math.max(0, dynamicDelay - elapsedTime);
-
-        if (adjustedDelay > 0) {
-          await new Promise((resolve) => setTimeout(resolve, adjustedDelay));
-        }
-        lastSendTime = Date.now();
+      // 添加延迟，除了最后一批和极小内容（如单个标点符号）
+      if (i + sendBatchSize < content.length && currentBatch.length > 1) {
+        // 为流结束的最后部分使用更短的延迟
+        const finalDelay = isStreamEnding && content.length - i < 10 ? Math.min(actualDelay, config.finalLowDelay || 1) : actualDelay;
+        await new Promise((resolve) => setTimeout(resolve, finalDelay));
       }
     }
   } catch (error) {
@@ -2187,45 +1915,15 @@ async function sendContentCharByChar(content, originalJson, writer, encoder, del
 async function sendContentInBatches(content, originalJson, writer, encoder, delay, config) {
   if (!content || content.length === 0) return;
 
-  // 根据内容长度和配置选择批处理大小 - 更智能的批处理大小
-  let batchSize;
-  if (content.length > 200) {
-    batchSize = config.maxBatchSize || 6;
-  } else if (content.length > 100) {
-    batchSize = 4;
-  } else if (content.length > 50) {
-    batchSize = 3;
-  } else {
-    batchSize = 2;
-  }
+  // 根据内容长度和配置选择批处理大小
+  const batchSize = content.length > 100 ? config.maxBatchSize || 5 : content.length > 50 ? 3 : 2;
 
-  // 根据内容长度动态调整延迟 - 更平滑的延迟
-  const adjustedDelay = content.length > 100 ? Math.min(delay, config.fastOutputDelay || 2) : delay;
-
-  // 检测内容是否包含自然语言断点
-  const punctuationMarks = [".", "。", "!", "！", "?", "？", ",", "，", ";", "；", ":", "：", "\n"];
-
-  // 跟踪上次发送的时间
-  let lastSendTime = Date.now();
+  // 根据内容长度动态调整延迟
+  const adjustedDelay = content.length > 100 ? Math.min(delay, config.fastOutputDelay || 3) : delay;
 
   try {
-    let i = 0;
-    while (i < content.length) {
-      // 寻找最近的自然断点
-      let endIndex = Math.min(i + batchSize, content.length);
-      let foundNaturalBreak = false;
-
-      // 在当前批次范围内查找断点
-      if (endIndex < content.length - 1) {
-        for (let j = i + Math.floor(batchSize / 2); j <= Math.min(i + batchSize * 1.5, content.length); j++) {
-          if (punctuationMarks.includes(content[j])) {
-            endIndex = j + 1; // 包含标点符号
-            foundNaturalBreak = true;
-            break;
-          }
-        }
-      }
-
+    for (let i = 0; i < content.length; i += batchSize) {
+      const endIndex = Math.min(i + batchSize, content.length);
       const batch = content.substring(i, endIndex);
 
       // 创建新的JSON对象，只包含当前批次
@@ -2236,28 +1934,9 @@ async function sendContentInBatches(content, originalJson, writer, encoder, dela
       const batchLine = `data: ${JSON.stringify(batchJson)}\n\n`;
       await writer.write(encoder.encode(batchLine));
 
-      // 动态调整延迟
-      let dynamicDelay = adjustedDelay;
-
-      // 在自然断点处增加轻微延迟
-      if (foundNaturalBreak) {
-        dynamicDelay = Math.min(adjustedDelay * 1.2, adjustedDelay + 1.5);
-      }
-
-      // 更新索引到下一个位置
-      i = endIndex;
-
       // 只在批次之间添加延迟，最后一批不添加
-      if (i < content.length) {
-        // 计算实际经过的时间，避免延迟累积
-        const currentTime = Date.now();
-        const elapsedTime = currentTime - lastSendTime;
-        const finalDelay = Math.max(0, dynamicDelay - elapsedTime);
-
-        if (finalDelay > 0) {
-          await new Promise((r) => setTimeout(r, finalDelay));
-        }
-        lastSendTime = Date.now();
+      if (i + batchSize < content.length) {
+        await new Promise((r) => setTimeout(r, adjustedDelay));
       }
     }
   } catch (error) {
@@ -2297,8 +1976,7 @@ async function handleTokenManagement(req, env) {
         const tokenKeys = data.tokens.map((token) => getTokenByIndexOrKey(token));
         const results = { success: true, removed: 0, failed: 0, messages: [] };
 
-        const lockId = acquireDataLock("batch-remove");
-        if (!lockId) {
+        if (!acquireDataLock()) {
           return jsonResponse({ success: false, message: "系统正忙，请稍后再试" }, 429);
         }
 
@@ -2307,8 +1985,7 @@ async function handleTokenManagement(req, env) {
 
           for (const tokenKey of tokenKeys) {
             try {
-              // 使用skipLock=true，因为我们已经获取了锁
-              const result = await removeTokenFromKV(env, tokenKey, true);
+              const result = await removeTokenFromKV(env, tokenKey, true); // 传递skipLock=true，因为我们已经获取了锁
               if (result.success) {
                 results.removed++;
               } else {
@@ -2325,7 +2002,7 @@ async function handleTokenManagement(req, env) {
           results.message = "成功删除 " + results.removed + "/" + tokenKeys.length + " 个令牌";
           return jsonResponse(results, 200);
         } finally {
-          releaseDataLock(false, lockId);
+          releaseDataLock();
         }
       } else {
         // 单个令牌删除
@@ -2339,8 +2016,7 @@ async function handleTokenManagement(req, env) {
         const results = { success: true, updated: 0, skipped: 0, failed: 0, messages: [] };
         const targetStatus = data.enable;
 
-        const lockId = acquireDataLock("batch-toggle");
-        if (!lockId) {
+        if (!acquireDataLock()) {
           return jsonResponse({ success: false, message: "系统正忙，请稍后再试" }, 429);
         }
 
@@ -2367,13 +2043,6 @@ async function handleTokenManagement(req, env) {
               // 切换令牌状态
               tokens[tokenIndex].enabled = targetStatus;
               tokens[tokenIndex].lastModified = Date.now();
-
-              // 如果是启用令牌，重置连续错误计数
-              if (targetStatus === true) {
-                tokens[tokenIndex].consecutiveErrors = 0;
-                Logger.debug(`批量启用令牌 ${obfuscateKey(tokenKey)}，已重置连续错误计数`);
-              }
-
               results.updated++;
             } catch (error) {
               results.failed++;
@@ -2384,12 +2053,9 @@ async function handleTokenManagement(req, env) {
           await saveTokensToKV(env);
           const action = targetStatus ? "启用" : "禁用";
           results.message = "成功" + action + " " + results.updated + "/" + tokenKeys.length + " 个令牌，跳过 " + results.skipped + " 个已" + action + "的令牌";
-          if (targetStatus) {
-            results.message += "，已重置所有启用令牌的连续错误计数";
-          }
           return jsonResponse(results, 200);
         } finally {
-          releaseDataLock(false, lockId);
+          releaseDataLock();
         }
       } else {
         // 单个令牌切换
@@ -2776,59 +2442,45 @@ export default {
     Logger.info("执行定期任务");
 
     try {
-      // 获取锁
-      const lockId = acquireDataLock("scheduled-task");
-      if (!lockId) {
-        Logger.warn("定期任务无法获取锁，可能有其他任务正在执行");
-        return;
-      }
+      // 加载令牌
+      await loadTokensFromKV(env);
 
-      try {
-        // 加载令牌
-        await loadTokensFromKV(env);
+      // 加载统计数据
+      await loadStatsFromKV(env);
 
-        // 加载统计数据
-        await loadStatsFromKV(env);
+      // 清理旧数据
+      cleanupOldRequestData();
 
-        // 清理旧数据
-        cleanupOldRequestData();
+      // 检查禁用的令牌，尝试恢复长时间未使用的令牌
+      const now = Date.now();
+      const ONE_DAY = 24 * 60 * 60 * 1000;
+      let tokensChanged = false;
 
-        // 检查禁用的令牌，尝试恢复长时间未使用的令牌
-        const now = Date.now();
-        const ONE_DAY = 24 * 60 * 60 * 1000;
-        let tokensChanged = false;
-
-        tokens.forEach((token, index) => {
-          // 如果令牌已禁用且最后错误时间超过一天，尝试恢复
-          if (!token.enabled && token.lastErrorTime && now - new Date(token.lastErrorTime).getTime() > ONE_DAY) {
-            Logger.info(`尝试恢复禁用令牌: ${obfuscateKey(token.key)}`);
-            tokens[index].enabled = true;
-            tokens[index].consecutiveErrors = 0;
-            tokensChanged = true;
-          }
-        });
-
-        // 如果令牌状态有变化，保存更新
-        if (tokensChanged) {
-          await saveTokensToKV(env);
+      tokens.forEach((token, index) => {
+        // 如果令牌已禁用且最后错误时间超过一天，尝试恢复
+        if (!token.enabled && token.lastErrorTime && now - new Date(token.lastErrorTime).getTime() > ONE_DAY) {
+          Logger.info(`尝试恢复禁用令牌: ${obfuscateKey(token.key)}`);
+          tokens[index].enabled = true;
+          tokens[index].consecutiveErrors = 0;
+          tokensChanged = true;
         }
+      });
 
-        // 强制保存所有统计数据
-        await saveStatsToKV(env, true);
-
-        // 重置批量保存计数器
-        pendingUpdates = 0;
-        lastKVSaveTime = Date.now();
-
-        Logger.info("定期任务完成");
-      } finally {
-        // 确保释放锁
-        releaseDataLock(false, lockId);
+      // 如果令牌状态有变化，保存更新
+      if (tokensChanged) {
+        await saveTokensToKV(env);
       }
+
+      // 强制保存所有统计数据
+      await saveStatsToKV(env, true);
+
+      // 重置批量保存计数器
+      pendingUpdates = 0;
+      lastKVSaveTime = Date.now();
+
+      Logger.info("定期任务完成");
     } catch (error) {
       Logger.error("定期任务执行错误:", error);
-      // 确保在错误情况下也释放锁
-      releaseDataLock(true);
     }
   },
 };
@@ -3440,25 +3092,31 @@ const dashboardHtml = `
       <!-- 批量操作表单 -->
       <form id="batchActionsForm" class="mb-4">
         <div class="d-flex flex-wrap gap-2">
-          <button type="button" id="enableSelectedBtn" class="btn btn-success btn-sm" disabled>
+          <button type="button" id="enableSelectedBtn" class="btn btn-light btn-sm" disabled>
             <i class="bi bi-check-circle me-1"></i>启用所选
           </button>
-          <button type="button" id="disableSelectedBtn" class="btn btn-warning btn-sm" disabled>
+          <button type="button" id="disableSelectedBtn" class="btn btn-light btn-sm" disabled>
             <i class="bi bi-slash-circle me-1"></i>禁用所选
           </button>
-          <button type="button" id="deleteSelectedBtn" class="btn btn-danger btn-sm" disabled>
+          <button type="button" id="deleteSelectedBtn" class="btn btn-light btn-sm" disabled>
             <i class="bi bi-trash me-1"></i>删除所选
           </button>
-          <button type="button" id="refreshBalanceBtn" class="btn btn-info btn-sm text-white" disabled>
+          <button type="button" id="refreshBalanceBtn" class="btn btn-light btn-sm" disabled>
             <i class="bi bi-currency-exchange me-1"></i>刷新余额
           </button>
-          <button type="button" id="copySelectedBtn" class="btn btn-secondary btn-sm" disabled>
-            <i class="bi bi-clipboard-check me-1"></i>复制所选key
+          <button type="button" id="selectNoBalanceBtn" class="btn btn-light btn-sm">
+            <i class="bi bi-question-circle me-1"></i>选择无余额数据
           </button>
-          <div class="ms-auto d-flex gap-2">
+          <button type="button" id="selectLowBalanceBtn" class="btn btn-light btn-sm">
+            <i class="bi bi-currency-dollar me-1"></i>余额≤0
+          </button>
+          <button type="button" id="selectLowBalanceLimitBtn" class="btn btn-light btn-sm">
+            <i class="bi bi-currency-dollar me-1"></i>余额≤5
+          </button>
+          <div class="ms-auto">
             <div class="input-group">
               <input type="text" class="form-control form-control-sm" id="tokenSearch" placeholder="搜索令牌...">
-              <button type="button" id="clearSearchBtn" class="btn btn-outline-secondary btn-sm">
+              <button type="button" id="clearSearchBtn" class="btn btn-light btn-sm">
                 <i class="bi bi-x"></i>
               </button>
             </div>
@@ -3517,7 +3175,6 @@ const dashboardHtml = `
       const disableSelectedBtn = document.getElementById('disableSelectedBtn');
       const deleteSelectedBtn = document.getElementById('deleteSelectedBtn');
       const refreshBalanceBtn = document.getElementById('refreshBalanceBtn');
-      const copySelectedBtn = document.getElementById('copySelectedBtn');
       
       // 统计数据元素
       const rpmElement = document.getElementById('rpm');
@@ -3561,8 +3218,8 @@ const dashboardHtml = `
           if (response.ok) {
             document.getElementById('tokenInput').value = '';
             showAlert(data.message, 'success');
-            // 强制从KV刷新令牌列表，但抑制刷新消息
-            refreshTokenList(true, true);
+            // 强制从KV刷新令牌列表
+            refreshTokenList(true);
           } else {
             showAlert(data.message || '添加令牌失败', 'danger');
           }
@@ -3643,40 +3300,6 @@ const dashboardHtml = `
         batchRefreshBalance(Array.from(selectedTokens));
       });
       
-      // 批量复制所选key按钮点击
-      copySelectedBtn.addEventListener('click', function() {
-        if (selectedTokens.size === 0) {
-          showAlert('请先选择要复制的令牌', 'warning');
-          return;
-        }
-
-        // 获取选中的令牌key
-        const selectedKeys = Array.from(selectedTokens)
-          .map(index => {
-            const token = tokens[parseInt(index)];
-            return token?.originalKey || token?.key;
-          })
-          .filter(key => key); // 过滤掉无效的令牌
-
-        if (selectedKeys.length === 0) {
-          showAlert('没有有效的令牌可以复制', 'warning');
-          return;
-        }
-
-        // 将令牌key以换行符连接
-        const keysText = selectedKeys.join('\\n');
-
-        // 复制到剪贴板
-        navigator.clipboard.writeText(keysText)
-          .then(() => {
-            showAlert('已复制 ' + selectedKeys.length + ' 个令牌到剪贴板', 'success');
-          })
-          .catch(err => {
-            console.error('复制失败:', err);
-            showAlert('复制失败，请重试', 'danger');
-          });
-      });
-      
       // 搜索令牌
       document.getElementById('tokenSearch').addEventListener('input', function() {
         filterTokenTable(this.value);
@@ -3726,7 +3349,7 @@ const dashboardHtml = `
           // 刷新表格
           renderTokenTable();
           
-          // 只有在非抑制消息且是强制刷新且有消息时才显示通知
+          // 如果是强制刷新且返回了消息，且不需要抑制消息显示，则显示通知
           if (force && data.message && !suppressMessage) {
             showAlert(data.message, 'success');
           }
@@ -4229,7 +3852,6 @@ const dashboardHtml = `
         disableSelectedBtn.disabled = !hasSelected;
         deleteSelectedBtn.disabled = !hasSelected;
         refreshBalanceBtn.disabled = !hasSelected;
-        copySelectedBtn.disabled = !hasSelected;
         
         // 更新全选框状态
         const selectAllCheckbox = document.getElementById('selectAllTokens');
@@ -4259,6 +3881,88 @@ const dashboardHtml = `
           alertElement.classList.remove('show');
         }, 3000);
       }
+
+      // 选择余额不足按钮点击事件
+      document.getElementById('selectLowBalanceBtn').addEventListener('click', function() {
+        // 清除现有选择
+        clearSelection();
+        
+        // 选择所有余额为0或负数的令牌
+        tokens.forEach((token, index) => {
+          if (token.balance !== null && token.balance <= 0) {
+            selectToken(index);
+          }
+        });
+        
+        const selectedCount = selectedTokens.size;
+        if (selectedCount > 0) {
+          showAlert('已选择 ' + selectedCount + ' 个余额不足的令牌', 'info');
+        } else {
+          showAlert('未找到余额不足的令牌', 'info');
+        }
+      });
+
+      // 选择无余额数据按钮点击事件
+      document.getElementById('selectNoBalanceBtn').addEventListener('click', function() {
+        // 清除现有选择
+        clearSelection();
+        
+        // 选择所有没有余额数据的令牌
+        tokens.forEach((token, index) => {
+          if (token.balance === null) {
+            selectToken(index);
+          }
+        });
+        
+        const selectedCount = selectedTokens.size;
+        if (selectedCount > 0) {
+          showAlert('已选择 ' + selectedCount + ' 个无余额数据的令牌', 'info');
+        } else {
+          showAlert('未找到无余额数据的令牌', 'info');
+        }
+      });
+
+      // 添加辅助函数
+      function clearSelection() {
+        selectedTokens.clear();
+        document.querySelectorAll('.token-checkbox').forEach(checkbox => {
+          checkbox.checked = false;
+          checkbox.closest('tr').classList.remove('row-selected');
+        });
+        document.getElementById('selectAllTokens').checked = false;
+        document.getElementById('selectAllTokens').indeterminate = false;
+        updateBatchActionButtons();
+      }
+
+      function selectToken(index) {
+        const checkbox = document.querySelector('.token-checkbox[data-token="' + index + '"]');
+        if (checkbox) {
+          checkbox.checked = true;
+          checkbox.closest('tr').classList.add('row-selected');
+          selectedTokens.add(index.toString());
+        }
+        updateBatchActionButtons();
+      }
+
+      // 添加新的选择余额小于等于5的按钮点击事件
+      document.getElementById('selectLowBalanceLimitBtn').addEventListener('click', function() {
+        // 清除现有选择
+        clearSelection();
+        
+        // 选择所有余额小于等于5的令牌
+        tokens.forEach((token, index) => {
+          if (token.balance !== null && token.balance <= 5) {
+            selectToken(index);
+          }
+        });
+        
+        const selectedCount = selectedTokens.size;
+        if (selectedCount > 0) {
+          showAlert('已选择 ' + selectedCount + ' 个余额小于等于5的令牌', 'info');
+        } else {
+          showAlert('未找到余额小于等于5的令牌', 'info');
+        }
+      });
     });
   </script>
 </body>
